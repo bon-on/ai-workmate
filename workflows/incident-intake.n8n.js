@@ -1,0 +1,13 @@
+import { workflow, node, trigger, newCredential, placeholder, expr } from '@n8n/workflow-sdk';
+
+const intake = trigger({ type: 'n8n-nodes-base.webhook', version: 2.1, config: { name: 'Incident Intake', parameters: { httpMethod: 'POST', path: 'ai-workmate-incident', authentication: 'none', responseMode: 'responseNode', options: { ipWhitelist: '127.0.0.1,::1' } }, position: [240, 300] }, output: [{ body: { source: 'n8n', severity: 'error', title: 'Workflow failed', details: 'Example failure', executionId: '123' } }] });
+const normalize = node({
+  type: 'n8n-nodes-base.code', version: 2,
+  config: { name: 'Normalize Incident', parameters: { mode: 'runOnceForAllItems', language: 'javaScript', jsCode: "const body = $input.first().json.body || {};\nconst incident = { source: String(body.source || 'unknown'), severity: String(body.severity || 'error'), title: String(body.title || 'Automation incident'), details: String(body.details || body.message || 'No details'), executionId: body.executionId ? String(body.executionId) : null, receivedAt: new Date().toISOString() };\nincident.text = ['[자동화 장애 알림]', '심각도: ' + incident.severity, '출처: ' + incident.source, '내용: ' + incident.title, incident.details, incident.executionId ? '실행 ID: ' + incident.executionId : null, '', 'Telegram에서 /incident 명령으로 진단을 시작할 수 있습니다.'].filter(Boolean).join('\\n');\nreturn [{ json: incident }];" }, position: [520, 300] },
+  output: [{ source: 'n8n', severity: 'error', title: 'Workflow failed', details: 'Example failure', executionId: '123', receivedAt: '2026-06-24T00:00:00Z', text: '[자동화 장애 알림]\n...' }]
+});
+const send = node({ type: 'n8n-nodes-base.telegram', version: 1.2, config: { name: 'Send Incident Alert', parameters: { resource: 'message', operation: 'sendMessage', chatId: placeholder('Your Telegram numeric chat ID'), text: expr('{{ $json.text }}'), replyMarkup: 'none', additionalFields: { appendAttribution: false } }, credentials: { telegramApi: newCredential('AI Workmate Telegram') }, position: [780, 300] }, output: [{ ok: true, result: { message_id: 1, text: 'incident' } }] });
+const respond = node({ type: 'n8n-nodes-base.respondToWebhook', version: 1.5, config: { name: 'Acknowledge Incident', parameters: { respondWith: 'json', responseBody: expr('{{ { accepted: true, receivedAt: $("Normalize Incident").item.json.receivedAt, executionId: $("Normalize Incident").item.json.executionId } }}'), options: { responseCode: 202 } }, position: [1040, 300] }, output: [{ accepted: true, executionId: '123' }] });
+
+export default workflow('ai-workmate-incident-intake', 'AI Workmate - Incident Intake')
+  .add(intake).to(normalize).to(send).to(respond);

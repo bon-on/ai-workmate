@@ -1,0 +1,7 @@
+{
+  "updatedAt": "2026-01-01",
+  "holdings": [
+    { "symbol": "005930", "name": "Example holding", "quantity": 10, "costBasis": 700000 },
+    { "name": "Manually valued asset", "costBasis": 1000000, "manualMarketValue": 1050000 }
+  ]
+}

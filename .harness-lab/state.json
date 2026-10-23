@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "0.2.0",
+  "files": {
+    "AGENTS.md": "dbd8a85f48a69874597971cd3de8dc58c2d90290ae80e58d0976373e3c28d6e8",
+    "CLAUDE.md": "e874f7fd2922c423a80d816750e9e6292c2711cc2bc62e5c919eb5d06bb8b5c5",
+    "harness/workflow.md": "413a37240b0e5e015ac59fbd25ef96c332534c6654bd4408e362c5cb50e90520",
+    ".claude/agents/code-reviewer.md": "e256bc0bbdd08ed5f6fe9c606e4ad6a8f324c18aac9267df064bff0741168f91",
+    "harness/templates/feature-spec.md": "413e6f69e96a4eea2f9db66af707c72652079d7a84b0eceba10bf28bb7d65a67",
+    "harness/templates/adr.md": "60c177bdec5febd80af3c9dccc46cac993fcb4030bd30a33bb53c9f7153c9707",
+    "harness/templates/contract.md": "e7d36e04f5caa17017bd8be2abe563dfce83b4d8a0aa522d19b2e5bcaed1af6f"
+  }
+}

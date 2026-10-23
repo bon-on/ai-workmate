@@ -1,0 +1,28 @@
+{
+  "name": "telegram-codex-bridge",
+  "version": "0.1.0",
+  "description": "Telegram bot that runs Claude Code jobs (Codex CLI fallback) from chat messages.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "start:daemon": "scripts/bridge-daemon.sh start",
+    "stop:daemon": "scripts/bridge-daemon.sh stop",
+    "status:daemon": "scripts/bridge-daemon.sh status",
+    "install:startup": "scripts/install_launchd_startup.sh",
+    "personal-ops:backup": "scripts/backup-personal-ops.sh",
+    "test": "node --test",
+    "verify": "node scripts/verify.mjs",
+    "verify:harness": "node ../harness-lab/dist/index.js verify . harness/verify.json --output out/evidence/harness-latest",
+    "audit:harness": "node ../harness-lab/dist/index.js audit .",
+    "english-study:build": "node src/english-study-message.js",
+    "telegram:send": "node src/telegram-send.js",
+    "telegram:me": "node src/telegram-tools.js me",
+    "telegram:webhook": "node src/telegram-tools.js webhook-info",
+    "telegram:webhook:delete": "node src/telegram-tools.js delete-webhook",
+    "telegram:updates": "node src/telegram-tools.js updates"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

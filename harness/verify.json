@@ -1,0 +1,17 @@
+{
+  "command": [
+    "node",
+    "--test"
+  ],
+  "inputs": [
+    "src",
+    "test",
+    "scripts",
+    "harness",
+    "package.json",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/agents"
+  ],
+  "timeoutMs": 120000
+}

@@ -1,0 +1,33 @@
+{
+  "sourcePriority": [
+    "spec",
+    "adr",
+    "constraints",
+    "goldenRules"
+  ],
+  "approvedPacks": [],
+  "suggestedPacks": [],
+  "version": "1",
+  "repoName": "ai-workmate",
+  "policyMode": "warn-block-critical",
+  "paths": {
+    "rulesDir": "harness/rules",
+    "specsDir": "harness/specs",
+    "adrsDir": "harness/adrs",
+    "contractsDir": "harness/contracts",
+    "templatesDir": "harness/templates",
+    "reportsDir": "out/evidence"
+  },
+  "requiredFiles": [
+    "harness/rules/constraints.md",
+    "harness/rules/golden-rules.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "harness/workflow.md",
+    "harness/project.md",
+    "harness/maintenance.json"
+  ],
+  "spec": "specs/verification.md",
+  "constraints": "rules/constraints.md",
+  "goldenRules": "rules/golden-rules.md"
+}

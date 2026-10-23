@@ -1,0 +1,30 @@
+# Secrets and machine-local settings
+.env
+.env.*
+!.env.example
+*.env
+.envrc
+.claude/settings.local.json
+.DS_Store
+node_modules/
+
+# Personal data, state and generated output (kept locally, never published)
+data/*
+!data/portfolio.example.json
+documents/*
+!documents/README.md
+backups/
+out/
+tmp/
+models/
+.ai-workmate/
+.harness-lab/backups/
+todos.md
+telegram_session_test.json
+telegram-english-study-message.txt
+english-study-weekday-hourly.md
+
+# Machine-specific deploy files
+deploy/home-lab/.env
+deploy/immich/
+deploy/launchd/
