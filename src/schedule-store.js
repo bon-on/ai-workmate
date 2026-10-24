@@ -102,8 +102,8 @@ export class ScheduleStore {
     return true;
   }
 
-  async reserveBriefingAttempt(entry, { retry = false, now = new Date() } = {}) {
-    if (this.isUsagePaused(now)) return false;
+  async reserveBriefingAttempt(entry, { retry = false, now = new Date(), ignoreUsagePause = false } = {}) {
+    if (!ignoreUsagePause && this.isUsagePaused(now)) return false;
     const kind = getBriefingKind(entry.prompt);
     if (!kind) return true;
     const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(now);

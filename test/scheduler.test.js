@@ -185,3 +185,19 @@ test("usage pause prevents even context preparation", async (t) => {
   assert.deepEqual(await runDueSchedules(input), []);
   assert.equal(calls(), 0);
 });
+
+test("an AI usage pause still delivers the locally built evening briefing", async (t) => {
+  const { schedules, input, calls } = await setup(t);
+  await schedules.add({ chatId: "1", userId: "2", workspaceAlias: "default",
+    prompt: "[AI_WORKMATE_EVENING_BRIEF_V1]", nextRunAt: input.now.toISOString(), intervalMs: 86400000 });
+  await schedules.pauseForUsageLimit("You've hit your usage limit", input.now);
+  const settled = [];
+  input.runLocalBriefing = async (_entry, kind) => `${kind} brief`;
+  input.onJobSettled = async (job) => settled.push([job.kind, job.status, job.summary]);
+  await runDueSchedules(input);
+  assert.deepEqual(settled, [["scheduled-local", "completed", "evening brief"]]);
+  assert.equal(calls(), 0, "the AI trend brief stays paused");
+  assert.ok(schedules.list().find((entry) => entry.prompt.startsWith("[AI_WORKMATE_EVENING")).nextRunAt > input.now.toISOString());
+  await runDueSchedules(input);
+  assert.equal(settled.length, 1, "once per day");
+});

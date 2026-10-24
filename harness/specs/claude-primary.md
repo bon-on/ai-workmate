@@ -23,10 +23,12 @@ Every chat, delegated, approved and scheduled job runs `codex exec`. The user wa
 - Scheduled/briefing tiers map to `SCHEDULED_CLAUDE_MODEL`/`SCHEDULED_CLAUDE_EFFORT` on Claude and the existing Codex settings on fallback.
 - `/n8n` stays on Codex unless `CLAUDE_MCP_CONFIG` provides MCP servers for Claude.
 - Scheduled usage pause only triggers from the final failing attempt, so a Claude limit with a successful Codex fallback does not pause schedules.
+- A usage pause does not skip the locally built morning and evening briefings; their once-per-day ledger still applies.
 - `/status` and the dashboard show Claude limits next to Codex limits.
 ## Constraints
 - No real Claude/Codex requests, service restarts or user-state edits during verification; tests use fake executables and temp state.
 ## Evidence
 - test/claude-primary-gaps.test.js: brief mode and quality retry, usage pause only from the final failing attempt, /status Claude limits (fixes a ReferenceError in handleMessage), Codex fallback job header, 0.95 threshold and scheduled effort mapping. Settlement logic moved verbatim to src/job-settle.js for testing.
+- test/scheduler.test.js: a usage pause still delivers the local evening briefing once while the AI trend brief stays paused.
 - node --test
 - npm run verify:harness

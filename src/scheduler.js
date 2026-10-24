@@ -43,7 +43,10 @@ export async function runDueSchedules({
         .catch((error) => console.error("English study failure notice failed:", error.message));
       continue;
     }
-    if (schedules.isUsagePaused?.(now)) continue;
+    const briefingKind = getBriefingKind(entry.prompt);
+    // Morning and evening briefings are built locally, so an AI usage pause must not skip them.
+    const isLocalBriefing = Boolean(runLocalBriefing) && ["morning", "evening"].includes(briefingKind);
+    if (!isLocalBriefing && schedules.isUsagePaused?.(now)) continue;
     if (jobs.getActiveJob(entry.chatId)) {
       // Leave its occurrence intact. A busy check must never pull tomorrow's
       // reservation back into today (including entries captured by an old tick).
@@ -64,16 +67,15 @@ export async function runDueSchedules({
       chatId: entry.chatId,
       workspaceAlias: workspace.alias,
     }) ?? [];
-    if (schedules.reserveBriefingAttempt && !await schedules.reserveBriefingAttempt(entry, { now })) {
+    if (schedules.reserveBriefingAttempt && !await schedules.reserveBriefingAttempt(entry, { now, ignoreUsagePause: isLocalBriefing })) {
       await schedules.markStarted(entry.id, now);
       continue;
     }
     // Persist advancement before slow context collection or process startup.
     // A crash may skip this occurrence, but must not repeatedly spend tokens.
-    const isBriefing = Boolean(getBriefingKind(entry.prompt));
+    const isBriefing = Boolean(briefingKind);
     if (isBriefing) await schedules.markStarted(entry.id, now);
-    const briefingKind = getBriefingKind(entry.prompt);
-    if (runLocalBriefing && ["morning", "evening"].includes(briefingKind)) {
+    if (isLocalBriefing) {
       try {
         const summary = await runLocalBriefing(entry, briefingKind, now);
         await onJobSettled(localJob(entry, workspace, briefingKind, now, "completed", summary));
