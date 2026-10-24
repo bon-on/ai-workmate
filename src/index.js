@@ -1,3 +1,4 @@
+import net from "node:net";
 import { loadConfig, loadEnvFile } from "./config.js";
 import { cleanupStaleJobDirs, JobManager } from "./job-manager.js";
 import { createCodexLimitReader } from "./codex-rate-limits.js";
@@ -25,6 +26,9 @@ import { runOperationalMonitor } from "./operational-monitor.js";
 import { maybeRunDailyRepoChecks } from "./repo-checks.js";
 import { announceRestart } from "./ops-actions.js";
 
+// Node 24 gives each address family 250ms before trying the next; with no IPv6 route and
+// ~300ms to Telegram over IPv4, every connection fails with ETIMEDOUT.
+net.setDefaultAutoSelectFamilyAttemptTimeout(1000);
 installLogTimestamps();
 loadEnvFile();
 
