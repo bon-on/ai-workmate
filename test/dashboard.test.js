@@ -29,6 +29,7 @@ test("rendered dashboard script parses and formats schedule labels", () => {
   assert.equal(context.scheduleName("[AI_WORKMATE_REMINDER]\n약 복용"), "개인 알림 · 약 복용");
   assert.equal(context.scheduleName("[AI_WORKMATE_NATURAL_SCHEDULE]\n설명\n요청: AI 뉴스"), "AI 예약 · AI 뉴스");
   assert.equal(context.scheduleName("[CUSTOM] 확인"), "확인");
+  assert.equal(context.scheduleName("[AI_WORKMATE_ENGLISH_STUDY_V1]\n영어 학습: 뉴스 기사 단어·예문·복습 (로컬 생성)"), "영어 학습");
   assert.equal(context.scheduleRepeat("every 1d 0h"), "매일");
 });
 

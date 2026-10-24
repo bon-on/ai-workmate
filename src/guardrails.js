@@ -52,5 +52,11 @@ export function checkServerCommandSafety(argv) {
     return { allowed: false, reason: "server command prefix is not allowed" };
   }
 
+  // node/python3 run a script file directly: any interpreter flag before it (-e, -pe, -Bc, --inspect, ...)
+  // could run inline code or open a debugger outside the sandbox.
+  if (["node", "python3"].includes(argv[0]) && (!argv[1] || argv[1].startsWith("-"))) {
+    return { allowed: false, reason: `${argv[0]} must be followed by a script file (no interpreter flags)` };
+  }
+
   return { allowed: true };
 }

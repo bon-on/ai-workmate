@@ -2,9 +2,9 @@
 
 The following n8n workflow drafts are installed but intentionally unpublished:
 
-- `AI Workmate - Morning Brief` (`yAXfm2rCd2B8rcLX`)
-- `AI Workmate - Research Digest` (`veLf2vGKKTMQBZmI`)
-- `AI Workmate - Incident Intake` (`lsMwnnIkIBPjJamG`)
+- `AI Workmate - Morning Brief`
+- `AI Workmate - Research Digest`
+- `AI Workmate - Incident Intake`
 
 They remain inactive because the local n8n credential store currently has no Google or Telegram credentials. Before publishing:
 

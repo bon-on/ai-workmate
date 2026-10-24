@@ -1,4 +1,5 @@
 import { getBriefingKind } from "./briefing-quality.js";
+import { ENGLISH_STUDY_MARKER } from "./english-study.js";
 
 const BUSY_RETRY_MS = 60 * 1000;
 const runningTicks = new WeakSet();
@@ -12,6 +13,7 @@ export async function runDueSchedules({
   onJobSettled,
   decoratePrompt,
   runLocalBriefing,
+  runEnglishStudy,
   now = new Date(),
 }) {
   if (runningTicks.has(schedules)) return [];
@@ -25,6 +27,20 @@ export async function runDueSchedules({
       await schedules.markStarted(entry.id, now);
       const reminder = entry.prompt.replace(/^\[AI_WORKMATE_REMINDER\]\s*/, "").trim();
       await telegram.sendMessage(entry.chatId, `⏰ 알림\n${reminder}`);
+      continue;
+    }
+    // Built by code and local Ollama: no AI job, so neither the usage pause nor a busy chat blocks it.
+    if (entry.prompt.startsWith(ENGLISH_STUDY_MARKER)) {
+      await schedules.markStarted(entry.id, now);
+      // Not awaited: feeds and the local model can take minutes and must not delay other due entries.
+      // A restart mid-build skips that day's lesson (markStarted already ran), like other briefings.
+      Promise.resolve()
+        .then(() => {
+          if (!runEnglishStudy) throw new Error("English study runner is not configured");
+          return runEnglishStudy(entry, now);
+        })
+        .catch((error) => telegram.sendMessage(entry.chatId, `⚠️ 영어 학습 메시지를 만들지 못했습니다: ${error.message}`))
+        .catch((error) => console.error("English study failure notice failed:", error.message));
       continue;
     }
     if (schedules.isUsagePaused?.(now)) continue;

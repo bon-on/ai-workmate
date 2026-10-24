@@ -5,7 +5,7 @@ import { ClaudeLimitState } from "./claude-runner.js";
 import { ApprovalStore } from "./approval-store.js";
 import { ProcessManager } from "./process-manager.js";
 import { formatError, PollFailureTracker } from "./poll-recovery.js";
-import { handleCallbackQuery, handleMessage } from "./router.js";
+import { handleUpdate } from "./router.js";
 import { MemoryStore } from "./memory-store.js";
 import { ScheduleStore } from "./schedule-store.js";
 import { runDueSchedules } from "./scheduler.js";
@@ -19,6 +19,7 @@ import { ensurePersonalBriefingSchedules } from "./briefings.js";
 import { decorateScheduledPrompt } from "./briefing-context.js";
 import { createJobSettler } from "./job-settle.js";
 import { buildLocalBriefing } from "./local-briefing.js";
+import { runEnglishStudy } from "./english-study.js";
 import { installLogTimestamps, trimRuntimeLogs } from "./maintenance.js";
 import { runOperationalMonitor } from "./operational-monitor.js";
 import { maybeRunDailyRepoChecks } from "./repo-checks.js";
@@ -128,26 +129,8 @@ async function main() {
 
       for (const update of updates) {
         nextOffset = update.update_id + 1;
-        if (update.callback_query) {
-          await handleCallbackQuery({
-            callbackQuery: update.callback_query,
-            config,
-            telegram,
-            jobs,
-            workspaces,
-            memories,
-            approvals,
-            personalOps,
-            onJobSettled: settleJob,
-          });
-          continue;
-        }
-        if (!update.message) {
-          continue;
-        }
-
-        await handleMessage({
-          message: update.message,
+        await handleUpdate({
+          update,
           config,
           telegram,
           jobs,
@@ -220,6 +203,9 @@ async function runScheduleTick() {
     }),
     runLocalBriefing: (entry, kind, now) => buildLocalBriefing({
       kind, config, chatId: entry.chatId, personalOps, schedules, now,
+    }),
+    runEnglishStudy: (entry, now) => runEnglishStudy({
+      telegram, chatId: entry.chatId, personalOps, config, now,
     }),
   });
 }

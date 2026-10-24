@@ -5,6 +5,7 @@ status: accepted
 related_specs:
   - claude-primary
   - ai-usage-report
+  - english-study
 ---
 # Claude primary engine
 ## Context

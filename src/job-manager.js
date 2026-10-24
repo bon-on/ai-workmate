@@ -524,17 +524,22 @@ async function finalizeJob(manager, job, logStream, result) {
   job.signal = result.signal ?? null;
   job.status = result.status;
   job.summary = result.summaryOverride;
-  if (job.status === "completed") {
-    job.artifacts = await findRecentImageArtifacts({
-      workspace: job.workspacePath,
-      startedAt: job.startedAt,
-      finishedAt: job.finishedAt,
-    });
+  try {
+    if (job.status === "completed") {
+      job.artifacts = await findRecentImageArtifacts({
+        workspace: job.workspacePath,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+      });
+    }
+  } catch (error) {
+    // Artifacts are optional; a scan error must not leave the chat permanently busy.
+    console.error(`Artifact scan failed for ${job.jobId}:`, error.message);
+    job.artifacts = [];
+  } finally {
+    manager.activeJobs.delete(job.chatId);
+    await new Promise((resolve) => logStream.end(resolve));
   }
-
-  manager.activeJobs.delete(job.chatId);
-
-  await new Promise((resolve) => logStream.end(resolve));
 }
 
 async function readOptionalText(filePath) {
@@ -614,7 +619,17 @@ export function buildChildProcessEnv(baseEnv = process.env, nodeExecutable = pro
   // ~/.local/bin is the Claude Code native installer location; launchd PATH omits it.
   const required = [path.dirname(nodeExecutable), "/opt/homebrew/bin", "/usr/local/bin", path.join(homeDir, ".local", "bin")];
   const merged = [...new Set([...required, ...existing])];
-  return { ...baseEnv, PATH: merged.join(path.delimiter) };
+  return { ...withoutBridgeSecrets(baseEnv), PATH: merged.join(path.delimiter) };
+}
+
+// Bridge-only credentials and allowlists. AI jobs read untrusted web content and /serve runs
+// workspace code, so neither should see the bot token in its environment.
+const BRIDGE_ONLY_ENV = ["TELEGRAM_BOT_TOKEN", "ALLOWED_CHAT_IDS", "ALLOWED_USER_IDS", "DEFAULT_TELEGRAM_TARGET_CHAT_ID"];
+
+export function withoutBridgeSecrets(env = process.env) {
+  const copy = { ...env };
+  for (const key of BRIDGE_ONLY_ENV) delete copy[key];
+  return copy;
 }
 
 function extractStructuredError(text) {

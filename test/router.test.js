@@ -60,6 +60,10 @@ test("natural recommendation feedback is classified conservatively", () => {
   assert.deepEqual(parseNaturalPreference("평일 장거리 외출 추천은 앞으로 하지 마"), { type: "avoid", text: "평일 장거리 외출 추천은 앞으로 하지 마" });
   assert.deepEqual(parseNaturalPreference("어제 개발 도구 추천은 좋았어"), { type: "like", text: "어제 개발 도구 추천은 좋았어" });
   assert.equal(parseNaturalPreference("오늘은 뭘 추천해줄래?"), null);
+  assert.equal(parseNaturalPreference("좋아하는 영화 추천해줘"), null);
+  assert.equal(parseNaturalPreference("볼만한 거 추천해줘 별로인 건 빼고"), null);
+  assert.equal(parseNaturalPreference("주말 나들이 추천 별로였어").type, "avoid");
+  assert.equal(parseNaturalPreference("그 산책 추천 마음에 들었어").type, "like");
 });
 
 test("handleMessage routes personal inbox commands", async () => {

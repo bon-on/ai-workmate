@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { withoutBridgeSecrets } from "./job-manager.js";
 
 export class ProcessManager {
   constructor() {
@@ -18,7 +19,7 @@ export class ProcessManager {
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
     const child = spawn(argv[0], argv.slice(1), {
       cwd: workspace.path,
-      env: process.env,
+      env: withoutBridgeSecrets(process.env),
       stdio: ["ignore", "pipe", "pipe"],
       detached: false,
     });

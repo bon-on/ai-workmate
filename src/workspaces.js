@@ -74,8 +74,9 @@ export class WorkspaceSessionStore {
   }
 
   getWorkspaceByAlias(alias) {
-    const workspacePath = this.workspaces.byAlias[alias];
-    if (!workspacePath) {
+    // Own string entries only: "constructor" or "toString" must not resolve to Object.prototype members.
+    const workspacePath = Object.hasOwn(this.workspaces.byAlias, alias) ? this.workspaces.byAlias[alias] : null;
+    if (typeof workspacePath !== "string" || !workspacePath) {
       return null;
     }
 

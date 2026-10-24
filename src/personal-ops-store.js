@@ -18,6 +18,7 @@ export class PersonalOpsStore {
     this.experiments = new Map();
     this.trendTopics = [];
     this.repoChecks = null;
+    this.englishStudy = { words: [], links: [] };
     this.saveQueue = Promise.resolve();
   }
 
@@ -34,6 +35,10 @@ export class PersonalOpsStore {
       this.experiments = new Map((parsed.experiments ?? []).filter(validExperiment).map((row) => [row.id, row]));
       this.trendTopics = (parsed.trendTopics ?? []).filter((row) => row?.chatId && row?.title && row?.sentAt);
       this.repoChecks = parsed.repoChecks?.checkedAt && Array.isArray(parsed.repoChecks.repos) ? parsed.repoChecks : null;
+      this.englishStudy = {
+        words: (Array.isArray(parsed.englishStudy?.words) ? parsed.englishStudy.words : []).filter((row) => row?.chatId && row?.word && row?.sentAt),
+        links: (Array.isArray(parsed.englishStudy?.links) ? parsed.englishStudy.links : []).filter((row) => row?.chatId && row?.link),
+      };
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
@@ -301,6 +306,27 @@ export class PersonalOpsStore {
     return result;
   }
 
+  getEnglishStudy(chatId) {
+    const id = String(chatId);
+    return {
+      words: this.englishStudy.words.filter((row) => row.chatId === id),
+      links: this.englishStudy.links.filter((row) => row.chatId === id).map((row) => row.link),
+    };
+  }
+
+  async recordEnglishStudy({ chatId, link, words = [], now = new Date() }) {
+    const id = String(chatId);
+    const sentAt = now.toISOString();
+    this.englishStudy.words.push(...words.map((row) => ({
+      chatId: id, word: String(row.word).slice(0, 40), meaning: String(row.meaning || "").slice(0, 80), pos: row.pos || "", sentAt,
+    })));
+    if (link) this.englishStudy.links.push({ chatId: id, link: String(link).slice(0, 500), sentAt });
+    // Bounded history: enough for the 60-day repeat window and review quizzes.
+    this.englishStudy.words = this.englishStudy.words.slice(-1000);
+    this.englishStudy.links = this.englishStudy.links.slice(-300);
+    await this.#save();
+  }
+
   async reserveAlert(key, { cooldownMs = 12 * 60 * 60 * 1000, now = new Date() } = {}) {
     const existing = this.alerts.get(key);
     if (existing && now.getTime() - Date.parse(existing.sentAt) < cooldownMs) return false;
@@ -408,6 +434,7 @@ export class PersonalOpsStore {
       experiments: [...this.experiments.values()],
       trendTopics: this.trendTopics,
       repoChecks: this.repoChecks,
+      englishStudy: this.englishStudy,
     };
     const serialized = `${JSON.stringify(payload, null, 2)}\n`;
     const write = this.saveQueue.then(async () => {

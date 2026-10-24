@@ -9,6 +9,7 @@ related_specs:
   - repo-checks
   - ops-approval
   - ai-usage-report
+  - english-study
 evidence_files:
   - out/evidence/harness-latest/checks.json
 ---

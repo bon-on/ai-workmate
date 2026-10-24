@@ -21,8 +21,8 @@ export async function findRecentImageArtifacts({
       return;
     }
 
-    const stats = await fs.stat(filePath);
-    if (stats.mtimeMs < lowerBound || stats.mtimeMs > upperBound) {
+    const stats = await fs.stat(filePath).catch(() => null);
+    if (!stats || stats.mtimeMs < lowerBound || stats.mtimeMs > upperBound) {
       return;
     }
 
@@ -39,15 +39,17 @@ export async function findRecentImageArtifacts({
     .slice(0, limit);
 }
 
-async function walkDirectory(root, onFile) {
-  const entries = await fs.readdir(root, { withFileTypes: true });
+async function walkDirectory(root, onFile, depth = 0) {
+  // Unreadable or vanished directories are skipped; depth bounds the scan of large workspaces.
+  if (depth > 8) return;
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     const fullPath = path.join(root, entry.name);
     if (entry.isDirectory()) {
       if (IGNORED_DIRECTORIES.has(entry.name)) {
         continue;
       }
-      await walkDirectory(fullPath, onFile);
+      await walkDirectory(fullPath, onFile, depth + 1);
       continue;
     }
 

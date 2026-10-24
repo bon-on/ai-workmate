@@ -31,8 +31,8 @@ export const TOOL_CATALOG = [
   },
   {
     id: "english-study",
-    name: "English study builder",
-    description: "Run npm run english-study:build locally or through a Codex request.",
+    name: "English study",
+    description: "Daily news vocabulary with Korean meanings and review at 12:10 (ENGLISH_STUDY_TIME); /english sends one now. npm run english-study:build renders the static weekly lesson.",
   },
   {
     id: "trading",

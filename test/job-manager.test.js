@@ -2,6 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager, buildBridgePrompt, buildChildProcessEnv, buildCodexArgs, summarizeProcessOutput } from "../src/job-manager.js";
 
+test("child processes do not inherit the bot token or allowlists", () => {
+  const env = buildChildProcessEnv({ PATH: "/bin", TELEGRAM_BOT_TOKEN: "secret", ALLOWED_CHAT_IDS: "1", HOME: "/h" }, "/n/node", "/h");
+  assert.equal(env.TELEGRAM_BOT_TOKEN, undefined);
+  assert.equal(env.ALLOWED_CHAT_IDS, undefined);
+  assert.equal(env.HOME, "/h");
+});
+
 test("buildChildProcessEnv preserves PATH and makes env-based Node CLIs available", () => {
   const env = buildChildProcessEnv({ PATH: "/usr/bin:/bin", KEEP_ME: "yes" }, "/custom/node/bin/node", "/Users/me");
 

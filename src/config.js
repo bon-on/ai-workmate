@@ -32,6 +32,8 @@ const DEFAULTS = {
   weeklyReviewMinute: 30,
   aiTrendBriefHour: 12,
   aiTrendBriefMinute: 0,
+  englishStudyHour: 12,
+  englishStudyMinute: 10,
   denyMode: "reply",
 };
 
@@ -147,6 +149,7 @@ export function loadConfig(env = process.env) {
   const eveningBrief = parseClock(env.EVENING_BRIEF_TIME, DEFAULTS.eveningBriefHour, DEFAULTS.eveningBriefMinute, "EVENING_BRIEF_TIME");
   const weeklyReview = parseClock(env.WEEKLY_REVIEW_TIME, DEFAULTS.weeklyReviewHour, DEFAULTS.weeklyReviewMinute, "WEEKLY_REVIEW_TIME");
   const aiTrendBrief = parseClock(env.AI_TREND_BRIEF_TIME, DEFAULTS.aiTrendBriefHour, DEFAULTS.aiTrendBriefMinute, "AI_TREND_BRIEF_TIME");
+  const englishStudy = parseClock(env.ENGLISH_STUDY_TIME, DEFAULTS.englishStudyHour, DEFAULTS.englishStudyMinute, "ENGLISH_STUDY_TIME");
 
   return {
     telegramBotToken: token,
@@ -190,6 +193,9 @@ export function loadConfig(env = process.env) {
     transcriptionModelPath: path.resolve(env.TRANSCRIPTION_MODEL_PATH || path.join(process.cwd(), "models", "ggml-base.bin")),
     defaultTelegramTargetChatId: env.DEFAULT_TELEGRAM_TARGET_CHAT_ID || allowedChatIds[0] || null,
     personalBriefingsEnabled: env.PERSONAL_BRIEFINGS_ENABLED !== "false",
+    englishStudyEnabled: env.ENGLISH_STUDY_ENABLED !== "false",
+    englishStudyHour: englishStudy.hour,
+    englishStudyMinute: englishStudy.minute,
     morningBriefHour: morningBrief.hour,
     morningBriefMinute: morningBrief.minute,
     eveningBriefHour: eveningBrief.hour,
@@ -249,6 +255,7 @@ export function loadConfig(env = process.env) {
     ),
     dashboardEnabled,
     dashboardHost: env.DASHBOARD_HOST || DEFAULTS.dashboardHost,
+    dashboardAllowedHosts: (env.DASHBOARD_ALLOWED_HOSTS || "").split(",").map((row) => row.trim().toLowerCase()).filter(Boolean),
     dashboardPort: parseInteger(env.DASHBOARD_PORT, DEFAULTS.dashboardPort, "DASHBOARD_PORT"),
     tradingDashboardPort: parseInteger(env.TRADING_DASHBOARD_PORT, DEFAULTS.tradingDashboardPort, "TRADING_DASHBOARD_PORT"),
     n8nPort: parseInteger(env.N8N_PORT, DEFAULTS.n8nPort, "N8N_PORT"),

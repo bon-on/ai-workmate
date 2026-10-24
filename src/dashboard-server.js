@@ -38,6 +38,12 @@ export function startDashboardServer({
   let healthCache = { value: null, expiresAt: 0 };
 
   const server = http.createServer(async (request, response) => {
+    // DNS rebinding: a foreign page can reach 127.0.0.1 under its own hostname, so the Host must be known.
+    if (!isAllowedHost(request.headers.host, config)) {
+      response.writeHead(421, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Unknown host");
+      return;
+    }
     const url = new URL(request.url, `http://${request.headers.host || "127.0.0.1"}`);
     if (url.pathname === "/api/document" && ["GET", "HEAD"].includes(request.method)) {
       await serveDocument(request, response, url, config);
@@ -66,7 +72,7 @@ export function startDashboardServer({
     }
 
     if (url.pathname === "/api/command" && request.method === "POST") {
-      if (!isSameOrigin(request)) {
+      if (!isSameOrigin(request, config)) {
         sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
         return;
       }
@@ -85,7 +91,7 @@ export function startDashboardServer({
     }
 
     if (url.pathname === "/api/repo-checks" && request.method === "POST") {
-      if (!isSameOrigin(request)) {
+      if (!isSameOrigin(request, config)) {
         sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
         return;
       }
@@ -122,7 +128,7 @@ export function startDashboardServer({
     }
     const retryExecution = url.pathname.match(/^\/api\/n8n\/executions\/(\d+)\/retry$/);
     if (retryExecution && request.method === "POST") {
-      if (!isSameOrigin(request)) {
+      if (!isSameOrigin(request, config)) {
         sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
         return;
       }
@@ -133,7 +139,7 @@ export function startDashboardServer({
 
     const workflowAction = url.pathname.match(/^\/api\/n8n\/workflows\/([A-Za-z0-9_-]+)\/(publish|unpublish)$/);
     if (workflowAction && request.method === "POST") {
-      if (!isSameOrigin(request)) {
+      if (!isSameOrigin(request, config)) {
         sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
         return;
       }
@@ -179,15 +185,33 @@ export async function executeDashboardCommand({ command, config, telegram, jobs,
   const chatId = config.allowedChatIds[0] ?? "dashboard";
   const userId = config.allowedUserIds[0] ?? "dashboard";
   const messages = [];
-  const dashboardTelegram = {
-    ...telegram,
-    async sendMessage(_chatId, message) {
-      messages.push(String(message));
+  const approverId = config.allowedUserIds[0];
+  async function sendDashboardMessage(_chatId, message, extra = {}) {
+    // Approval buttons only work in Telegram, so they are forwarded there instead of being dropped.
+    if (extra?.reply_markup) {
+      if (approverId && config.allowedChatIds[0]) {
+        await telegram.sendMessage(chatId, message, extra);
+        messages.push(`${message}\n\n→ 승인 버튼을 텔레그램으로 보냈습니다. 텔레그램에서 승인하세요.`);
+      } else {
+        messages.push(`${message}\n\n→ 승인이 필요한 요청입니다. ALLOWED_USER_IDS가 없어 대시보드 요청은 승인할 수 없으니 텔레그램에서 직접 요청하세요.`);
+      }
       return { message_id: null };
+    }
+    messages.push(String(message));
+    return { message_id: null };
+  }
+  // A Proxy keeps the Telegram client's prototype methods (sendDocument, ...) bound to the real instance.
+  const dashboardTelegram = new Proxy(telegram ?? {}, {
+    get(target, property) {
+      if (property === "sendMessage") return sendDashboardMessage;
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
     },
-  };
+  });
   const routedText = name === "/ask" ? text.slice(4).trim() : text;
   if (!routedText) throw new Error("요청 내용을 입력하세요.");
+  // "/ask" is for natural-language requests; a command after it would bypass DASHBOARD_COMMANDS.
+  if (name === "/ask" && routedText.startsWith("/")) throw new Error("This command is not available from the dashboard.");
   await handleMessage({
     message: { chat: { id: chatId }, from: { id: userId }, text: routedText },
     requestSource: "dashboard",
@@ -208,14 +232,29 @@ export async function executeDashboardCommand({ command, config, telegram, jobs,
   return { ok: true, messages, jobId: ["/done", "/archive", "/snooze", "/inbox", "/lab"].includes(name) ? null : activeJob?.jobId ?? null };
 }
 
-function isSameOrigin(request) {
+function isSameOrigin(request, config = {}) {
   const origin = request.headers.origin;
   if (!origin) return false;
   try {
-    return new URL(origin).host === request.headers.host;
+    return new URL(origin).host === request.headers.host && isAllowedHost(request.headers.host, config);
   } catch {
     return false;
   }
+}
+
+// Loopback names, Tailscale MagicDNS names (tailscale serve) and DASHBOARD_ALLOWED_HOSTS.
+export function isAllowedHost(hostHeader, config = {}) {
+  if (!hostHeader) return false;
+  let hostname;
+  try {
+    hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (["127.0.0.1", "localhost", "[::1]"].includes(hostname)) return true;
+  // MagicDNS names are managed by Tailscale and cannot be rebound to this machine's loopback.
+  if (hostname.endsWith(".ts.net")) return true;
+  return (config.dashboardAllowedHosts ?? []).includes(hostname);
 }
 
 function readJsonBody(request, maxBytes = 4096) {
@@ -1039,6 +1078,7 @@ export function renderDashboardHtml(config) {
       if (value.includes("EVENING_BRIEF")) return "이브닝 브리핑";
       if (value.includes("WEEKLY_REVIEW")) return "주간 리뷰";
       if (value.includes("AI_TREND_BRIEF")) return "AI 트렌드";
+      if (value.includes("ENGLISH_STUDY")) return "영어 학습";
       if (value.includes("AI_WORKMATE_REMINDER")) return "개인 알림 · " + value.replace(/^\\[AI_WORKMATE_REMINDER\\]\\s*/, "").slice(0, 42);
       if (value.includes("AI_WORKMATE_NATURAL_SCHEDULE")) {
         const request = value.match(/요청:\\s*([^\\n]+)/)?.[1] || "예약된 AI 작업";

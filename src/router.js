@@ -1,3 +1,4 @@
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,7 @@ import { validatePublicUrl } from "./watch-runner.js";
 import { buildMorningBriefPrompt, buildEveningBriefPrompt, buildWeeklyReviewPrompt, buildAiTrendBriefPrompt, buildDailyDiscoveryPrompt } from "./briefings.js";
 import { buildAiTrendContext, buildBriefingContext } from "./briefing-context.js";
 import { buildLocalBriefing } from "./local-briefing.js";
+import { runEnglishStudy } from "./english-study.js";
 import { extractBriefingRecommendations, getBriefingKind, supportsBriefingFeedback } from "./briefing-quality.js";
 import {
   buildAcceptedMessage,
@@ -58,6 +60,7 @@ const HELP_TEXT = [
   "/repos - run harness and publish-readiness checks on local repositories",
   "/publish-check <repo> - list publish blockers for one repository (locations only)",
   "/ai-usage [days] - AI job counts, fallbacks, failures and tokens",
+  "/english - send today's English words and example sentences from a news article now",
   "/restart - restart this bridge after inline approval (no running jobs)",
   "/inbox [add <type> <text>] - capture or list personal inbox items",
   "/done <id> | /snooze <id> [hours] | /archive <id> - triage inbox",
@@ -107,6 +110,42 @@ export function isAuthorized(message, config) {
     !userId || config.allowedUserIds.length === 0 || config.allowedUserIds.includes(userId);
 
   return chatAllowed && userAllowed;
+}
+
+// One Telegram update. A failing command is reported to its (authorized) chat instead of
+// escaping into the poll loop, where it would count as a network failure and slow polling.
+export async function handleUpdate({ update, ...input }) {
+  const deps = { ...input, telegram: splittingTelegram(input.telegram) };
+  try {
+    if (update.callback_query) return await handleCallbackQuery({ callbackQuery: update.callback_query, ...deps });
+    if (update.message) return await handleMessage({ message: update.message, ...deps });
+  } catch (error) {
+    console.error(`Update ${update.update_id} failed:`, error);
+    if (update.callback_query) await deps.telegram.answerCallbackQuery?.(update.callback_query.id, "처리하지 못했습니다").catch(() => {});
+    const source = update.message ?? (update.callback_query && { chat: update.callback_query.message?.chat, from: update.callback_query.from });
+    if (!source?.chat || !isAuthorized(source, deps.config)) return;
+    await deps.telegram.sendMessage(source.chat.id, `⚠️ 요청을 처리하지 못했습니다: ${String(error.message).slice(0, 300)}`)
+      .catch((notifyError) => console.error("Failure notice failed:", notifyError.message));
+  }
+}
+
+// Telegram rejects text over 4096 characters; long command replies (/job-logs, /schedules, ...)
+// are split, and inline buttons stay on the last part.
+export function splittingTelegram(telegram) {
+  return new Proxy(telegram, {
+    get(target, property) {
+      const value = target[property];
+      if (property !== "sendMessage") return typeof value === "function" ? value.bind(target) : value;
+      return async (chatId, text, extra = {}) => {
+        const parts = splitTelegramMessage(String(text ?? ""));
+        let last;
+        for (const [index, part] of parts.entries()) {
+          last = await target.sendMessage(chatId, part, index === parts.length - 1 ? extra : {});
+        }
+        return last;
+      };
+    },
+  });
 }
 
 export async function handleMessage({
@@ -473,6 +512,15 @@ async function handleCommand({
     return;
   }
 
+  if (normalized === "/english") {
+    await telegram.sendMessage(chatId, "📘 영어 학습 메시지를 만드는 중입니다… (뉴스·사전·로컬 Ollama, 최대 1~2분)");
+    // Not awaited for the same reason as /repos: the local model can take a minute.
+    runEnglishStudy({ telegram, chatId, personalOps, config })
+      .catch((error) => telegram.sendMessage(chatId, `⚠️ 영어 학습 메시지를 만들지 못했습니다: ${error.message}`))
+      .catch((error) => console.error("English study reply failed:", error.message));
+    return;
+  }
+
   if (normalized === "/publish-check") {
     const name = rest[0]?.trim();
     if (!name) {
@@ -775,7 +823,10 @@ async function handleCommand({
     const workspace = workspaces.getActiveWorkspace(chatId);
     const requested = path.resolve(workspace.path, rest.join(" "));
     const relative = path.relative(workspace.path, requested);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    // Symlinks are resolved too, so a link inside the workspace cannot send ~/.ssh or .env elsewhere.
+    const [realRoot, realFile] = await Promise.all([fsPromises.realpath(workspace.path).catch(() => null), fsPromises.realpath(requested).catch(() => null)]);
+    const realRelative = realRoot && realFile ? path.relative(realRoot, realFile) : relative;
+    if ([relative, realRelative].some((value) => value.startsWith("..") || path.isAbsolute(value))) {
       await telegram.sendMessage(chatId, "Workspace 밖의 파일은 전송할 수 없습니다.");
       return;
     }
@@ -1419,10 +1470,15 @@ async function requestPreferenceConfirmation({ approvals, telegram, message, pre
 export function parseNaturalPreference(text) {
   const value = String(text || "").trim();
   if (!/추천/.test(value)) return null;
-  if (/(추천.*(?:하지\s*마|빼줘|제외해|싫어|별로)|(?:싫어|별로).*추천)/.test(value)) {
+  // Feedback is about past recommendations; "좋아하는 영화 추천해줘" is a new request, not a preference.
+  if (/추천.*하지\s*마|추천(?:은|는)\s*(?:빼|제외)/.test(value)) {
     return { type: "avoid", text: value.slice(0, 500) };
   }
-  if (/(추천.*(?:좋았|좋아|마음에\s*들)|(?:좋았|좋아|마음에\s*들).*추천)/.test(value)) {
+  if (/추천\s*(?:해|해\s*줘|해\s*주세요|해줄래|좀)|알려\s*줘|[?？]\s*$/.test(value)) return null;
+  if (/(추천.*(?:싫었|별로였|별로야|별로다)|(?:싫었|별로였).*추천)/.test(value)) {
+    return { type: "avoid", text: value.slice(0, 500) };
+  }
+  if (/(추천.*(?:좋았|마음에\s*들었)|(?:좋았|마음에\s*들었).*추천)/.test(value)) {
     return { type: "like", text: value.slice(0, 500) };
   }
   return null;

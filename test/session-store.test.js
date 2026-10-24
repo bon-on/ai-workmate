@@ -74,3 +74,24 @@ test("TelegramSessionStore clears sessions by chat", async () => {
   assert.equal(store.resolveReply("1", 200), null);
   assert.equal(store.resolveReply("2", 201)?.sessionId, "sess-2");
 });
+
+test("a corrupt session file is moved aside instead of stopping startup, and saves are atomic and bounded", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-corrupt-"));
+  const file = path.join(dir, "sessions.json");
+  await fs.writeFile(file, "{ not json");
+  const store = new TelegramSessionStore(file);
+  const originalError = console.error;
+  console.error = () => {};
+  try { await store.load(); } finally { console.error = originalError; }
+  assert.equal(store.entries.size, 0);
+  assert.ok((await fs.readdir(dir)).some((name) => name.startsWith("sessions.json.corrupt-")));
+  await Promise.all(Array.from({ length: 520 }, (_, index) => store.rememberBotReply({
+    chatId: "1", messageId: index + 1, sessionId: `s${index}`, workspaceAlias: "default", jobId: `j${index}`,
+    createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+  })));
+  const saved = JSON.parse(await fs.readFile(file, "utf8"));
+  assert.equal(saved.entries.length, 500);
+  assert.equal(saved.entries[0].messageId, 21);
+  assert.equal(store.resolveReply("1", 1), null);
+  assert.ok(store.resolveReply("1", 520));
+});

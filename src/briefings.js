@@ -1,3 +1,5 @@
+import { ENGLISH_STUDY_MARKER, ENGLISH_STUDY_PROMPT } from "./english-study.js";
+
 const MORNING_MARKER = "[AI_WORKMATE_MORNING_BRIEF_V1]";
 const EVENING_MARKER = "[AI_WORKMATE_EVENING_BRIEF_V1]";
 const WEEKLY_MARKER = "[AI_WORKMATE_WEEKLY_REVIEW_V1]";
@@ -5,10 +7,16 @@ const AI_TREND_MARKER = "[AI_WORKMATE_AI_TREND_BRIEF_V1]";
 const DAILY_DISCOVERY_MARKER = "[AI_WORKMATE_DAILY_DISCOVERY_V1]";
 
 export async function ensurePersonalBriefingSchedules({ schedules, config, now = new Date() }) {
-  if (!config.personalBriefingsEnabled) return [];
-  const chatId = config.defaultTelegramTargetChatId || config.allowedChatIds[0];
-  const userId = config.allowedUserIds[0] || "system";
+  const chatId = config.defaultTelegramTargetChatId || config.allowedChatIds?.[0];
+  const userId = config.allowedUserIds?.[0] || "system";
   if (!chatId) return [];
+  // English study is a personal schedule too: either switch turns it off, and off removes it.
+  if (!config.personalBriefingsEnabled || !config.englishStudyEnabled) {
+    for (const disabled of schedules.list(chatId).filter((row) => row.prompt.includes(ENGLISH_STUDY_MARKER))) {
+      await schedules.remove({ chatId, id: disabled.id });
+    }
+  }
+  if (!config.personalBriefingsEnabled) return [];
   for (const obsolete of schedules.list(chatId).filter((row) => row.prompt.includes(DAILY_DISCOVERY_MARKER))) {
     await schedules.remove({ chatId, id: obsolete.id });
   }
@@ -18,6 +26,9 @@ export async function ensurePersonalBriefingSchedules({ schedules, config, now =
     { marker: WEEKLY_MARKER, hour: config.weeklyReviewHour, minute: config.weeklyReviewMinute, weekday: 0, prompt: buildWeeklyReviewPrompt(config.personalLocation) },
     { marker: AI_TREND_MARKER, hour: config.aiTrendBriefHour, minute: config.aiTrendBriefMinute, prompt: buildAiTrendBriefPrompt() },
   ];
+  if (config.englishStudyEnabled) {
+    definitions.push({ marker: ENGLISH_STUDY_MARKER, hour: config.englishStudyHour, minute: config.englishStudyMinute, prompt: ENGLISH_STUDY_PROMPT });
+  }
   const created = [];
   for (const definition of definitions) {
     const existing = schedules.list(chatId).find((row) => row.prompt.includes(definition.marker));
