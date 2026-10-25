@@ -1,4 +1,5 @@
 import fsPromises from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -19,69 +20,119 @@ import { buildAiTrendContext, buildBriefingContext } from "./briefing-context.js
 import { buildLocalBriefing } from "./local-briefing.js";
 import { runEnglishStudy } from "./english-study.js";
 import { extractBriefingRecommendations, getBriefingKind, supportsBriefingFeedback } from "./briefing-quality.js";
+import { formatKst, scheduleName, scheduleRepeatLabel } from "./schedule-names.js";
 import {
   buildAcceptedMessage,
   buildBusyMessage,
   buildCompletionMessage,
+  formatElapsed,
   formatJobStatus,
+  providerLabel,
   splitTelegramMessage,
+  statusLabel,
 } from "./format.js";
 
-const HELP_TEXT = [
-  "Send a plain text message to run an AI job (Claude, Codex fallback on rate limits).",
-  "",
-  "Commands:",
-  "/help - show this help",
-  "/capabilities - show allowed operations and safety rules",
-  "/admin <request> - request approval for a system-wide AI job",
-  "/dashboard - show AI Workmate dashboard",
-  "/ai-workmate:dashboard - show AI Workmate dashboard",
-  "/status - show the active job in this chat",
-  "/jobs - list recent jobs for this chat",
-  "/job <jobId> - show job details",
-  "/job-logs <jobId> - show recent AI job logs",
-  "/cancel - stop the active job in this chat",
-  "/new - clear saved reply-based AI sessions for this chat",
-  "/reset - alias for /new",
-  "/remember <text> - save a workspace memory for future jobs",
-  "/preference add <like|avoid> <text> | list | remove <id> - manage briefing preferences",
-  "/memories - list saved memories for the active workspace",
-  "/forget <id> - delete a saved memory",
-  "/schedule in 10m <prompt> - run a one-time scheduled AI job",
-  "/schedule every 1h <prompt> - run a recurring scheduled AI job",
-  "Natural scheduling examples: '10분 후에 알려줘', '내일 오후 3시에 전화하라고 알려줘', '매일 오후 2시에 AI 뉴스 요약해서 알려줘'",
-  "/schedules - list scheduled jobs for this chat",
-  "/unschedule <id> - delete a scheduled job",
-  "/delegate <prompt> - start an isolated concurrent AI job",
-  "/delegates - list delegated jobs for this chat",
-  "/delegate-cancel <jobId> - cancel a delegated job",
-  "/tools - list available bridge tools",
-  "/health - check services and external storage",
-  "/repos - run harness and publish-readiness checks on local repositories",
-  "/publish-check <repo> - list publish blockers for one repository (locations only)",
-  "/ai-usage [days] - AI job counts, fallbacks, failures and tokens",
-  "/english - send today's English words and example sentences from a news article now",
-  "/restart - restart this bridge after inline approval (no running jobs)",
-  "/inbox [add <type> <text>] - capture or list personal inbox items",
-  "/done <id> | /snooze <id> [hours] | /archive <id> - triage inbox",
-  "/watch <url> [label] | /watches | /unwatch <id> - monitor web changes",
-  "/lab now <topic> | list | archive <id> | discard <id> - manage the personal AI lab",
-  "/creative tonight <request> - queue an overnight creative build",
-  "/tr <보유|설정|매도> - operate the trading dry-run controls",
-  "/n8n <request> - inspect or operate n8n with Codex",
-  "/brief - build a daily operations brief",
-  "/morning | /evening | /weekly-review - create a personal briefing now",
-  "/ai-trends | /discover - run the AI trend or daily discovery briefing now",
-  "/research <topic> - research and create a sourced report",
-  "/incident <details> - diagnose an automation or service incident",
-  "/file <relative-path> - send a workspace file to this chat",
-  "/workspaces - list allowed workspaces",
-  "/workspace [alias] - show or switch the active workspace for this chat",
-  "/serve <command> - start a managed background server in the active workspace",
-  "/ps - list managed background servers for this chat",
-  "/logs <processId> - show recent logs for a managed process",
-  "/stop <processId> - stop a managed background server",
-].join("\n");
+const HELP_TOPICS = [
+  { key: "ai", aliases: ["작업"], title: "AI 작업", sample: "그냥 메시지 보내기, /status, /cancel, /delegate", lines: [
+    "메시지를 그냥 보내기 - AI 작업 실행 (Claude, 한도 도달 시 Codex)",
+    "결과 메시지에 답장 - 같은 대화를 이어서 작업",
+    "/status - 진행 중인 작업과 사용 한도",
+    "/jobs - 최근 작업 목록",
+    "/job <id> - 작업 상세 · /job-logs <id> - 작업 로그",
+    "/cancel - 진행 중인 작업 중단",
+    "/new (/reset) - 답장으로 이어가던 대화 초기화",
+    "/delegate <요청> - 다른 작업과 동시에 도는 백그라운드 작업",
+    "/delegates - 백그라운드 작업 목록 · /delegate-cancel <id> - 중단",
+    "/admin <요청> - 시스템 전체 권한 작업 (승인 필요)",
+    "/research <주제> - 출처가 있는 조사 보고서",
+    "/incident <내용> - 자동화·서비스 장애 진단",
+    "/n8n <요청> - n8n 조회·운영",
+    "/remember <내용> - 작업공간 메모리 저장 · /memories - 목록 · /forget <id> - 삭제",
+  ] },
+  { key: "schedule", aliases: ["예약"], title: "예약", sample: "/schedules, /runnow, /skip, /resume", lines: [
+    "자연어 예약 - '10분 후에 알려줘', '내일 오후 3시에 전화하라고 알려줘', '매일 오후 2시에 AI 뉴스 요약해서 알려줘'",
+    "/schedule in 10m <요청> - 한 번 실행 · /schedule every 1h <요청> - 반복 실행",
+    "/schedules - 예약 목록 (반복, 다음 실행, 취소 명령)",
+    "/unschedule <id> - 예약 삭제",
+    "/runnow <id> - 예약을 지금 바로 실행",
+    "/skip <id> - 다음 1회 건너뛰기",
+    "/resume - 사용 한도로 멈춘 AI 예약 다시 시작",
+  ] },
+  { key: "inbox", aliases: ["인박스", "브리핑"], title: "인박스·브리핑", sample: "할일: …, /inbox, /done, /morning", lines: [
+    "빠른 저장 - '할일: 우유 사기 내일', '메모: …', '아이디어: …', '읽기: …' (AI 없이 저장, 끝에 오늘/내일/모레/10/31/10월 31일을 붙이면 그날 23:59 마감)",
+    "링크만 보내기 - 읽기 목록에 저장",
+    "/inbox - 인박스 보기 · /inbox add [task|read|idea|document|journal|request] <내용>",
+    "/done <id> - 완료 · /snooze <id> [시간] - 미루기 · /archive <id> - 보관",
+    "/morning · /evening · /weekly-review - 개인 브리핑 지금 만들기",
+    "/ai-trends · /discover - AI 트렌드·오늘의 발견 브리핑",
+    "/brief - 운영 브리핑",
+    "/english - 오늘의 영어 단어·예문",
+    "/preference add <like|avoid> <내용> | list | remove <id> - 브리핑 추천 선호",
+    "/watch <url> [이름] · /watches · /unwatch <id> - 웹 변경 감시",
+    "/lab now <주제> | tonight <주제> | list | archive <id> | discard <id> - AI 실험실",
+    "/creative tonight <요청> - 야간 창작 작업",
+  ] },
+  { key: "ops", aliases: ["운영", "점검"], title: "운영·점검", sample: "/dashboard, /health, /repos, /ai-usage", lines: [
+    "/dashboard (/ai-workmate:dashboard) - 대시보드 요약",
+    "/health - 서비스·외장 저장소 점검",
+    "/repos - 로컬 저장소 하네스·공개 준비 점검",
+    "/publish-check <repo> - 저장소 하나의 공개 차단 요소 (위치만)",
+    "/ai-usage [일수] - AI 작업 수, 대체, 실패, 토큰",
+    "/tools - 브리지 도구 목록 · /capabilities - 허용 범위와 안전 규칙",
+    "/restart - 브리지 재시작 (승인 필요, 실행 중 작업 없을 때)",
+    "/tr <보유|설정|매도> - 트레이딩 드라이런 제어",
+  ] },
+  { key: "workspace", aliases: ["작업공간", "서버"], title: "작업공간·서버", sample: "/workspace, /file, /serve", lines: [
+    "/workspaces - 작업공간 목록 · /workspace [이름] - 보기/전환",
+    "/file <상대경로> - 작업공간 파일 받기",
+    "/serve <명령> - 백그라운드 서버 시작 · /ps - 목록",
+    "/logs <id> - 서버 로그 · /stop <id> - 서버 중지",
+  ] },
+];
+
+export function buildHelpText(topic = "") {
+  const wanted = String(topic || "").trim().toLowerCase().replace(/^\//, "");
+  const selected = wanted && HELP_TOPICS.find((row) => row.key === wanted || row.aliases.includes(wanted));
+  if (selected) return [`도움말 · ${selected.title}`, "", ...selected.lines.map((line) => `• ${line}`)].join("\n");
+  return [
+    wanted ? `'${wanted}' 도움말이 없습니다. 아래 주제 중에서 고르세요.\n` : null,
+    "AI Workmate 도움말",
+    "메시지를 그냥 보내면 AI가 처리하고, 결과에 답장하면 대화를 이어갑니다.",
+    "'할일: 우유 사기 내일'처럼 보내면 AI 없이 인박스에 저장됩니다.",
+    "",
+    ...HELP_TOPICS.map((row) => `• ${row.title} - ${row.sample} → /help ${row.key}`),
+  ].filter((line) => line !== null).join("\n");
+}
+
+// Telegram command menu (setMyCommands). Names allow only [a-z0-9_]; underscores map to the
+// hyphenated commands in normalizeCommand.
+export const BOT_COMMANDS = [
+  ["help", "도움말 (/help 주제)"],
+  ["status", "진행 중인 작업과 사용 한도"],
+  ["jobs", "최근 작업 목록"],
+  ["cancel", "진행 중인 작업 중단"],
+  ["new", "답장 대화 초기화"],
+  ["delegate", "백그라운드 작업 시작"],
+  ["schedules", "예약 목록"],
+  ["runnow", "예약 지금 실행 (/runnow id)"],
+  ["skip", "예약 다음 1회 건너뛰기 (/skip id)"],
+  ["resume", "멈춘 AI 예약 다시 시작"],
+  ["inbox", "인박스 보기"],
+  ["done", "인박스 항목 완료 (/done id)"],
+  ["snooze", "인박스 항목 미루기 (/snooze id)"],
+  ["morning", "모닝 브리핑 지금 받기"],
+  ["evening", "이브닝 브리핑 지금 받기"],
+  ["weekly_review", "주간 리뷰 만들기"],
+  ["ai_trends", "AI 트렌드 브리핑"],
+  ["english", "오늘의 영어 학습"],
+  ["watches", "웹 변경 감시 목록"],
+  ["lab", "AI 실험실"],
+  ["dashboard", "대시보드 요약"],
+  ["health", "서비스 점검"],
+  ["repos", "저장소 점검"],
+  ["ai_usage", "AI 사용량"],
+  ["workspace", "작업공간 보기/전환"],
+].map(([command, description]) => ({ command, description }));
 
 const CAPABILITIES_TEXT = [
   "Allowed:",
@@ -163,6 +214,7 @@ export async function handleMessage({
   personalOps,
   onJobSettled,
   readCodexLimits = null,
+  delegateOffers = pendingDelegates,
 }) {
   const chatId = message.chat.id;
   const unrestricted = false;
@@ -180,6 +232,11 @@ export async function handleMessage({
   }
 
   if (text && !text.startsWith("/")) {
+    const capture = personalOps ? parseQuickCapture(text) : null;
+    if (capture) {
+      await saveQuickCapture({ personalOps, telegram, chatId, capture });
+      return;
+    }
     const naturalSchedule = schedules ? parseNaturalScheduleRequest(text) : null;
     if (naturalSchedule) {
       const workspace = workspaces.getActiveWorkspace(chatId);
@@ -192,11 +249,10 @@ export async function handleMessage({
         intervalMs: naturalSchedule.intervalMs,
         weekdaysOnly: naturalSchedule.weekdaysOnly,
       });
-      const when = new Date(entry.nextRunAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
       await telegram.sendMessage(chatId, [
         `예약했습니다: ${entry.id}`,
         `${naturalSchedule.kind === "reminder" ? "알림" : "AI 작업"}: ${naturalSchedule.request}`,
-        `다음 실행: ${when}`,
+        `다음 실행: ${formatKst(entry.nextRunAt)}`,
         `반복: ${naturalSchedule.repeatLabel}`,
         `취소: /unschedule ${entry.id}`,
       ].join("\n"));
@@ -287,6 +343,9 @@ export async function handleMessage({
     resumeSession: replySession?.session ?? null,
     replyToMessageId: message.message_id ?? null,
     unrestricted,
+    delegateOffer: requestSource === "telegram" && delegateOffers
+      ? { store: delegateOffers, text, workspaceAlias: selectedWorkspace.alias }
+      : null,
   });
 }
 
@@ -300,6 +359,7 @@ export async function handleCallbackQuery({
   approvals,
   personalOps,
   onJobSettled,
+  delegateOffers = pendingDelegates,
 }) {
   const message = callbackQuery.message;
   if (!message || !isAuthorized({ ...message, from: callbackQuery.from }, config)) {
@@ -329,6 +389,46 @@ export async function handleCallbackQuery({
     await telegram.answerCallbackQuery(callbackQuery.id, "브리핑 선호에 반영했습니다.");
     await telegram.editMessageReplyMarkup(message.chat.id, message.message_id);
     await telegram.sendMessage(message.chat.id, `저장됨 · ${entry.type} · ${entry.text}`);
+    return;
+  }
+  if (scope === "inbox" && id && ["done", "later"].includes(action)) {
+    const done = action === "done";
+    // A briefing button can be pressed after the item was finished elsewhere; never reopen it.
+    const current = personalOps?.listInbox?.(message.chat.id, { includeClosed: true })?.find((row) => row.id === id);
+    if (current && current.status !== "open") {
+      await telegram.answerCallbackQuery(callbackQuery.id, "이미 처리한 항목입니다.");
+      await telegram.editMessageReplyMarkup(message.chat.id, message.message_id);
+      return;
+    }
+    const entry = await personalOps?.updateInbox?.({
+      chatId: message.chat.id,
+      id,
+      status: done ? "done" : "open",
+      snoozedUntil: done ? null : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+    await telegram.answerCallbackQuery(callbackQuery.id, entry
+      ? (done ? "완료 처리했습니다." : "24시간 뒤에 다시 보여드릴게요.")
+      : "이미 처리했거나 찾을 수 없는 항목입니다.");
+    if (entry) await telegram.editMessageReplyMarkup(message.chat.id, message.message_id);
+    return;
+  }
+  if (scope === "bg" && action === "run" && id) {
+    const pending = delegateOffers?.take({ key: id, chatId: message.chat.id, userId: callbackQuery.from?.id });
+    if (!pending || !checkPromptSafety(pending.text).allowed) {
+      await telegram.answerCallbackQuery(callbackQuery.id, "만료되었거나 권한이 없는 요청입니다.");
+      return;
+    }
+    await telegram.answerCallbackQuery(callbackQuery.id, "백그라운드로 시작합니다.");
+    await telegram.editMessageReplyMarkup(message.chat.id, message.message_id);
+    const workspace = workspaces.getWorkspaceByAlias(pending.workspaceAlias) || workspaces.getActiveWorkspace(message.chat.id);
+    await startDelegateJob({
+      jobs, telegram, onJobSettled,
+      chatId: message.chat.id,
+      userId: callbackQuery.from?.id ?? "unknown",
+      prompt: pending.text,
+      workspace,
+      memories: memories?.listForPrompt?.({ chatId: message.chat.id, workspaceAlias: workspace.alias }) ?? [],
+    });
     return;
   }
   if (scope === "brief" && id) {
@@ -437,7 +537,43 @@ async function handleCommand({
   const normalized = normalizeCommand(command);
 
   if (normalized === "/help" || normalized === "/start") {
-    await telegram.sendMessage(chatId, HELP_TEXT);
+    await telegram.sendMessage(chatId, buildHelpText(normalized === "/help" ? rest[0] : ""));
+    return;
+  }
+
+  if (normalized === "/resume") {
+    const pause = schedules?.getUsagePause?.();
+    if (!pause) {
+      await telegram.sendMessage(chatId, "AI 예약은 멈춰 있지 않습니다.");
+      return;
+    }
+    await schedules.clearUsagePause();
+    await telegram.sendMessage(chatId, `▶️ AI 예약을 다시 시작했습니다.${pause.reason ? `\n멈춘 이유: ${pause.reason}` : ""}`);
+    return;
+  }
+
+  if (normalized === "/runnow" || normalized === "/skip") {
+    const run = normalized === "/runnow";
+    if (!rest[0]) {
+      await telegram.sendMessage(chatId, `사용법: ${normalized} <예약 id>  (id는 /schedules 에서 확인)`);
+      return;
+    }
+    const method = run ? schedules?.runNow : schedules?.skipNext;
+    if (!method) {
+      await telegram.sendMessage(chatId, "예약 저장소가 설정되지 않았습니다.");
+      return;
+    }
+    const entry = await method.call(schedules, rest[0], { chatId, now: new Date() });
+    if (!entry) {
+      await telegram.sendMessage(chatId, `해당 예약을 찾지 못했습니다: ${rest[0]}`);
+      return;
+    }
+    const pausedNote = run && schedules.getUsagePause?.() ? "\nAI 예약이 일시정지 중이라 AI가 필요한 작업은 정지가 풀린 뒤 실행됩니다 (/resume)." : "";
+    await telegram.sendMessage(chatId, run
+      ? `${scheduleName(entry.prompt)} 예약을 곧 실행합니다 (1분 안에 시작).${pausedNote}`
+      : entry.removed
+        ? `${scheduleName(entry.prompt)}은 한 번만 실행되는 예약이라 삭제했습니다.`
+        : `${scheduleName(entry.prompt)} 예약을 한 번 건너뜁니다.\n다음 실행: ${formatKst(entry.nextRunAt) || "없음"}`);
     return;
   }
 
@@ -743,9 +879,10 @@ async function handleCommand({
       const prompt = briefingKind === "morning"
         ? buildMorningBriefPrompt(config.personalLocation)
         : buildEveningBriefPrompt(config.personalLocation);
-      const summary = await buildLocalBriefing({
+      const built = await buildLocalBriefing({
         kind: briefingKind, config, chatId, personalOps, schedules,
       });
+      const summary = typeof built === "string" ? built : built?.summary;
       await onJobSettled({
         jobId: `local-${briefingKind}-${Date.now()}`,
         kind: "scheduled-local",
@@ -764,6 +901,7 @@ async function handleCommand({
         summary,
         artifacts: [],
         replyToMessageId: message.message_id ?? null,
+        ...(built?.replyMarkup ? { replyMarkup: built.replyMarkup } : {}),
       });
       return;
     }
@@ -846,53 +984,49 @@ async function handleCommand({
     const model = job?.model || (engine === "claude" ? config.claudeModel : config.codexModel) || "default";
     const workDir = job?.workspacePath || workspace?.path || "(unknown)";
     const statusLines = [
-      `Engine: ${engine}  |  Model: ${model}  |  Dir: ${workDir}`,
+      `엔진: ${engine} · 모델: ${model} · 폴더: ${workDir}`,
     ];
     if (job?.usage) {
       const { inputTokens, cachedInputTokens, outputTokens } = job.usage;
-      statusLines.push(`Context: ${inputTokens.toLocaleString("ko-KR")} in + ${cachedInputTokens.toLocaleString("ko-KR")} cached + ${outputTokens.toLocaleString("ko-KR")} out`);
-    } else {
-      statusLines.push("Context: no active job");
+      statusLines.push(`컨텍스트: 입력 ${inputTokens.toLocaleString("ko-KR")} + 캐시 ${cachedInputTokens.toLocaleString("ko-KR")} + 출력 ${outputTokens.toLocaleString("ko-KR")}`);
     }
+    const remaining = (row) => row ? `${row.remainingPercent}% 남음` : "알 수 없음";
     if (limits?.status === "available") {
-      const fh = limits.fiveHour;
-      const wk = limits.weekly;
-      const fhLabel = fh ? `${fh.remainingPercent}% remaining` : "N/A";
-      const wkLabel = wk ? `${wk.remainingPercent}% remaining` : "N/A";
-      statusLines.push(`Codex limits: 5h ${fhLabel} | 7d ${wkLabel}`);
+      statusLines.push(`Codex 한도: 5시간 ${remaining(limits.fiveHour)} | 7일 ${remaining(limits.weekly)}`);
     } else {
-      statusLines.push("Codex limits: unavailable");
+      statusLines.push("Codex 한도: 확인 불가");
     }
     const claudeLimits = jobs.claudeLimits?.snapshot?.();
     if (claudeLimits?.status === "available") {
-      const label = (row) => row ? `${row.remainingPercent}% remaining` : "N/A";
-      statusLines.push(`Claude limits: 5h ${label(claudeLimits.fiveHour)} | 7d ${label(claudeLimits.weekly)}${claudeLimits.exhaustedUntil ? ` | Codex fallback until ${claudeLimits.exhaustedUntil}` : ""}`);
+      statusLines.push(`Claude 한도: 5시간 ${remaining(claudeLimits.fiveHour)} | 7일 ${remaining(claudeLimits.weekly)}${claudeLimits.exhaustedUntil ? ` | ${formatKst(claudeLimits.exhaustedUntil)}까지 Codex 대체` : ""}`);
     } else if (claudeLimits) {
-      statusLines.push("Claude limits: not observed yet");
+      statusLines.push("Claude 한도: 아직 확인 전");
     }
-    await telegram.sendMessage(chatId, `${statusLines.join("\n")}\n\n${formatJobStatus(job)}`);
+    const pause = schedules?.getUsagePause?.();
+    if (pause) statusLines.push(`⏸ AI 예약 멈춤 · ${formatKst(pause.until)}까지 · 다시 시작: /resume`);
+    await telegram.sendMessage(chatId, `${formatJobStatus(job)}\n\n${statusLines.join("\n")}`);
     return;
   }
 
   if (normalized === "/jobs") {
     const entries = jobs.listJobs(chatId).slice(0, 20);
     if (entries.length === 0) {
-      await telegram.sendMessage(chatId, "No jobs in this chat since the bridge started.");
+      await telegram.sendMessage(chatId, "브리지 시작 이후 이 채팅에서 실행한 작업이 없습니다.");
       return;
     }
 
-    await telegram.sendMessage(chatId, entries.map(formatJobLine).join("\n"));
+    await telegram.sendMessage(chatId, `최근 작업 (자세히: /job <id>)\n${entries.map(formatJobLine).join("\n")}`);
     return;
   }
 
   if (normalized === "/job") {
     if (rest.length === 0) {
-      await telegram.sendMessage(chatId, "Usage: /job <jobId>");
+      await telegram.sendMessage(chatId, "사용법: /job <작업 id>  (id는 /jobs 에서 확인)");
       return;
     }
 
     const job = jobs.getJob(chatId, rest[0]);
-    await telegram.sendMessage(chatId, job ? formatJobDetails(job) : `Unknown job: ${rest[0]}`);
+    await telegram.sendMessage(chatId, job ? formatJobDetails(job) : `해당 작업을 찾지 못했습니다: ${rest[0]}`);
     return;
   }
 
@@ -916,7 +1050,7 @@ async function handleCommand({
     const cancelled = await jobs.cancelJob(chatId);
     await telegram.sendMessage(
       chatId,
-      cancelled ? `Cancellation requested for job ${cancelled.jobId}.` : "No active job to cancel.",
+      cancelled ? `작업 ${cancelled.jobId} 중단을 요청했습니다.` : "중단할 작업이 없습니다.",
     );
     return;
   }
@@ -1003,7 +1137,7 @@ async function handleCommand({
     if (!parsed) {
       await telegram.sendMessage(
         chatId,
-        "Usage: /schedule in 10m <prompt>\nUsage: /schedule every 1h <prompt>",
+        "사용법: /schedule in 10m <요청>  (한 번)\n사용법: /schedule every 1h <요청>  (반복)\n자연어도 됩니다: '매일 오후 2시에 AI 뉴스 요약해서 알려줘'",
       );
       return;
     }
@@ -1018,16 +1152,13 @@ async function handleCommand({
       intervalMs: parsed.intervalMs,
       weekdaysOnly: parsed.weekdaysOnly,
     });
-    await telegram.sendMessage(
-      chatId,
-      [
-        `Scheduled ${entry.id}.`,
-        `Workspace: ${entry.workspaceAlias}`,
-        `Next run: ${entry.nextRunAt}`,
-        entry.weekdaysOnly ? "Weekdays only: yes" : null,
-        entry.intervalMs ? `Repeats every: ${formatDuration(entry.intervalMs)}` : "Repeats: no",
-      ].filter(Boolean).join("\n"),
-    );
+    await telegram.sendMessage(chatId, [
+      `예약했습니다: ${entry.id}`,
+      scheduleName(entry.prompt),
+      `반복: ${scheduleRepeatLabel(entry)}`,
+      `다음 실행: ${formatKst(entry.nextRunAt)}`,
+      `취소: /unschedule ${entry.id}`,
+    ].join("\n"));
     return;
   }
 
@@ -1039,19 +1170,10 @@ async function handleCommand({
 
     const entries = schedules.list(chatId);
     if (entries.length === 0) {
-      await telegram.sendMessage(chatId, "No scheduled jobs in this chat.");
+      await telegram.sendMessage(chatId, "이 채팅에 예약된 작업이 없습니다.");
       return;
     }
-
-    const lines = entries.map((entry) =>
-      [
-        `${entry.id} | ${entry.workspaceAlias} | ${entry.nextRunAt}`,
-        entry.intervalMs ? `every ${formatDuration(entry.intervalMs)}${entry.weekdaysOnly ? " weekdays" : ""}` : "one-time",
-        entry.failureCount ? `failures ${entry.failureCount}` : null,
-        entry.prompt,
-      ].filter(Boolean).join(" | "),
-    );
-    await telegram.sendMessage(chatId, lines.join("\n"));
+    await telegram.sendMessage(chatId, formatScheduleList(entries, schedules.getUsagePause?.() ?? null));
     return;
   }
 
@@ -1062,14 +1184,14 @@ async function handleCommand({
     }
 
     if (rest.length === 0) {
-      await telegram.sendMessage(chatId, "Usage: /unschedule <id>");
+      await telegram.sendMessage(chatId, "사용법: /unschedule <예약 id>  (id는 /schedules 에서 확인)");
       return;
     }
 
     const entry = await schedules.remove({ chatId, id: rest[0] });
     await telegram.sendMessage(
       chatId,
-      entry ? `Unscheduled ${entry.id}.` : `Unknown schedule: ${rest[0]}`,
+      entry ? `예약을 삭제했습니다: ${scheduleName(entry.prompt)} (${entry.id})` : `해당 예약을 찾지 못했습니다: ${rest[0]}`,
     );
     return;
   }
@@ -1088,48 +1210,27 @@ async function handleCommand({
     }
 
     const workspace = workspaces.getActiveWorkspace(chatId);
-    const promptMemories = memories?.listForPrompt?.({
-      chatId,
-      workspaceAlias: workspace.alias,
-    }) ?? [];
-    const started = await jobs.startJob({
-      chatId,
+    await startDelegateJob({
+      jobs, telegram, onJobSettled, chatId,
       userId: message.from?.id ?? "unknown",
       prompt: delegatedPrompt,
       workspace,
-      memories: promptMemories,
-      allowConcurrent: true,
-      jobKind: "delegate",
+      memories: memories?.listForPrompt?.({ chatId, workspaceAlias: workspace.alias }) ?? [],
       unrestricted,
     });
-    if (!started.accepted) {
-      await telegram.sendMessage(chatId, `Could not start delegated job: ${started.reason || "not accepted"}.`);
-      return;
-    }
-
-    await telegram.sendMessage(
-      chatId,
-      `Delegated job started.\nJob: ${started.job.jobId}\nWorkspace: ${workspace.alias}\nStatus: queued`,
-    );
-
-    started.job.completion
-      .then((job) => onJobSettled(job))
-      .catch(async (error) => {
-        await telegram.sendMessage(chatId, `Delegated job failed unexpectedly: ${error.message}`);
-      });
     return;
   }
 
   if (normalized === "/delegates") {
     const entries = jobs.listJobs(chatId, { kind: "delegate" });
     if (entries.length === 0) {
-      await telegram.sendMessage(chatId, "No delegated jobs in this chat.");
+      await telegram.sendMessage(chatId, "이 채팅에 백그라운드 작업이 없습니다.");
       return;
     }
 
     const lines = entries.map(
       (job) =>
-        `${job.jobId} | ${job.status} | ${job.workspaceAlias} | ${job.startedAt} | ${summarizePrompt(job.prompt)}`,
+        `${job.jobId} | ${statusLabel(job.status)} | ${job.workspaceAlias} | ${formatKst(job.startedAt)} | ${summarizePrompt(job.prompt)}`,
     );
     await telegram.sendMessage(chatId, lines.join("\n"));
     return;
@@ -1144,7 +1245,7 @@ async function handleCommand({
     const job = await jobs.cancelJobById(chatId, rest[0], { kind: "delegate" });
     await telegram.sendMessage(
       chatId,
-      job ? `Cancellation requested for delegated job ${job.jobId}.` : `Unknown delegated job: ${rest[0]}`,
+      job ? `백그라운드 작업 ${job.jobId} 중단을 요청했습니다.` : `해당 백그라운드 작업을 찾지 못했습니다: ${rest[0]}`,
     );
     return;
   }
@@ -1247,7 +1348,7 @@ async function handleCommand({
     return;
   }
 
-  await telegram.sendMessage(chatId, HELP_TEXT);
+  await telegram.sendMessage(chatId, `알 수 없는 명령입니다: ${command}\n\n${buildHelpText()}`);
 }
 
 function isStandaloneHttpUrl(text) {
@@ -1262,7 +1363,8 @@ function isStandaloneHttpUrl(text) {
 }
 
 function normalizeCommand(command) {
-  return command.toLowerCase().replace(/@[^:\s]+$/, "");
+  // Menu commands use underscores (/weekly_review); the bridge's names use hyphens.
+  return command.toLowerCase().replace(/@[^:\s]+$/, "").replace(/_/g, "-");
 }
 
 function nextTonightAt23(now = new Date()) {
@@ -1270,22 +1372,6 @@ function nextTonightAt23(now = new Date()) {
   next.setHours(23, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   return next.toISOString();
-}
-
-function formatDuration(ms) {
-  if (ms % (24 * 60 * 60 * 1000) === 0) {
-    return `${ms / (24 * 60 * 60 * 1000)}d`;
-  }
-
-  if (ms % (60 * 60 * 1000) === 0) {
-    return `${ms / (60 * 60 * 1000)}h`;
-  }
-
-  if (ms % (60 * 1000) === 0) {
-    return `${ms / (60 * 1000)}m`;
-  }
-
-  return `${ms}ms`;
 }
 
 function summarizePrompt(prompt, maxLength = 80) {
@@ -1297,28 +1383,135 @@ function summarizePrompt(prompt, maxLength = 80) {
   return `${compact.slice(0, maxLength - 3)}...`;
 }
 
+const JOB_KIND_LABELS = { chat: "대화", delegate: "백그라운드", scheduled: "예약", "scheduled-local": "로컬 브리핑" };
+
+function jobTitle(job) {
+  return String(job.prompt || "").startsWith("[") ? scheduleName(job.prompt) : summarizePrompt(job.prompt, 60);
+}
+
 function formatJobLine(job) {
-  return `${job.jobId} | ${job.kind} | ${job.status} | ${job.workspaceAlias} | ${job.startedAt} | ${summarizePrompt(job.prompt)}`;
+  return `${job.jobId} · ${statusLabel(job.status)} · ${JOB_KIND_LABELS[job.kind] ?? job.kind} · ${formatKst(job.startedAt)} · ${jobTitle(job)}`;
 }
 
 function formatJobDetails(job) {
+  const elapsed = job.finishedAt ? formatElapsed(job.startedAt, job.finishedAt) : "";
   return [
-    `Job: ${job.jobId}`,
-    `Kind: ${job.kind}`,
-    job.scheduleId ? `Schedule: ${job.scheduleId}` : null,
-    `Status: ${job.status}`,
-    `Workspace: ${job.workspaceAlias}`,
-    `Started: ${job.startedAt}`,
-    job.finishedAt ? `Finished: ${job.finishedAt}` : null,
-    job.exitCode == null ? null : `Exit code: ${job.exitCode}`,
-    job.signal ? `Signal: ${job.signal}` : null,
-    `Session: ${job.sessionId || "(unavailable)"}`,
+    `작업: ${job.jobId} · ${statusLabel(job.status)}`,
+    `종류: ${JOB_KIND_LABELS[job.kind] ?? job.kind} · 엔진: ${providerLabel(job)}`,
+    job.scheduleId ? `예약: ${job.scheduleId}` : null,
+    `시작: ${formatKst(job.startedAt)}${job.finishedAt ? ` · 종료: ${formatKst(job.finishedAt)}${elapsed ? ` (${elapsed})` : ""}` : ""}`,
+    `작업공간: ${job.workspaceAlias}`,
+    job.exitCode == null ? null : `종료 코드: ${job.exitCode}`,
+    job.signal ? `시그널: ${job.signal}` : null,
+    `세션: ${job.sessionId || "없음"}`,
+    `로그: /job-logs ${job.jobId}`,
     "",
     summarizePrompt(job.prompt, 500),
   ]
     .filter((line) => line !== null)
     .join("\n");
 }
+
+export function formatScheduleList(entries, pause = null) {
+  const lines = [`예약 ${entries.length}개 (시각은 KST)`];
+  if (pause) lines.push(`⏸ AI 예약 멈춤 · ${formatKst(pause.until)}까지${pause.reason ? ` · ${pause.reason}` : ""} · 다시 시작: /resume`);
+  for (const entry of entries) {
+    lines.push("", `• ${scheduleName(entry.prompt)} · ${scheduleRepeatLabel(entry)}`);
+    lines.push(`  다음 ${formatKst(entry.nextRunAt) || "없음"} · 취소 /unschedule ${entry.id}`);
+    if (entry.failureCount) {
+      const reason = String(entry.lastError || "").split("\n")[0].slice(0, 80);
+      lines.push(`  ⚠️ 연속 실패 ${entry.failureCount}회${reason ? ` (${reason})` : ""} · 지금 실행 /runnow ${entry.id}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+const QUICK_CAPTURE = { "할일": ["task", "할 일"], "메모": ["idea", "메모"], "아이디어": ["idea", "아이디어"], "읽기": ["read", "읽기"] };
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+// "할일: 우유 사기 내일" -> inbox entry without AI. A trailing 오늘/내일/모레/M/D/M월 D일 sets dueAt to
+// 23:59 KST of that day (a date in the past rolls to next year).
+export function parseQuickCapture(text, now = new Date()) {
+  const match = String(text || "").match(/^\s*(할\s?일|메모|아이디어|읽기)\s*[:：]\s*([\s\S]*)$/);
+  if (!match) return null;
+  const [type, label] = QUICK_CAPTURE[match[1].replace(/\s/g, "")];
+  let body = match[2].trim().slice(0, 2000);
+  let dueAt = null;
+  const due = body.match(/\s+(?:(오늘|내일|모레)|(\d{1,2})\s*\/\s*(\d{1,2})|(\d{1,2})\s*월\s*(\d{1,2})\s*일)(?:\s*까지)?$/);
+  if (due) {
+    const today = new Date(now.getTime() + KST_OFFSET_MS);
+    const [year, month, day] = [today.getUTCFullYear(), today.getUTCMonth() + 1, today.getUTCDate()];
+    let target = null;
+    if (due[1]) target = Date.UTC(year, month - 1, day + { 오늘: 0, 내일: 1, 모레: 2 }[due[1]]);
+    else {
+      const m = Number(due[2] ?? due[4]);
+      const d = Number(due[3] ?? due[5]);
+      const valid = (y) => { const value = new Date(Date.UTC(y, m - 1, d)); return value.getUTCMonth() === m - 1 && value.getUTCDate() === d ? value.getTime() : null; };
+      target = valid(year);
+      if (target != null && target < Date.UTC(year, month - 1, day)) target = valid(year + 1);
+    }
+    if (target != null) {
+      dueAt = new Date(target + (23 * 60 + 59) * 60 * 1000 - KST_OFFSET_MS).toISOString();
+      body = body.slice(0, due.index).trim();
+    }
+  }
+  return { type, label, text: body, dueAt };
+}
+
+async function saveQuickCapture({ personalOps, telegram, chatId, capture }) {
+  if (!capture.text) {
+    await telegram.sendMessage(chatId, `사용법: ${capture.label}: <내용> [오늘|내일|10/31|10월 31일]`);
+    return;
+  }
+  const entry = await personalOps.addInbox({ chatId, type: capture.type, text: capture.text, source: "telegram-quick", dueAt: capture.dueAt });
+  const due = capture.dueAt ? new Date(Date.parse(capture.dueAt) + KST_OFFSET_MS) : null;
+  await telegram.sendMessage(chatId, [
+    `📥 ${capture.label} 저장 · ${entry.id}`,
+    capture.text,
+    due ? `마감: ${due.getUTCMonth() + 1}월 ${due.getUTCDate()}일` : null,
+    `완료: /done ${entry.id} · 미루기: /snooze ${entry.id} · 목록: /inbox`,
+  ].filter(Boolean).join("\n"));
+}
+
+// Requests sent while a foreground job runs, kept briefly so a button can start them as a delegate.
+// Keys are short (callback_data limit is 64 bytes) and only the same chat (and user, when known) may use them.
+export class PendingDelegates {
+  constructor({ ttlMs = 30 * 60 * 1000, max = 50, now = () => Date.now() } = {}) {
+    this.ttlMs = ttlMs;
+    this.max = max;
+    this.now = now;
+    this.entries = new Map();
+  }
+
+  add({ chatId, userId = null, text, workspaceAlias = null }) {
+    this.#prune();
+    while (this.entries.size >= this.max) this.entries.delete(this.entries.keys().next().value);
+    const key = randomBytes(5).toString("hex");
+    this.entries.set(key, {
+      chatId: String(chatId),
+      userId: userId == null || userId === "unknown" ? null : String(userId),
+      text,
+      workspaceAlias,
+      expiresAt: this.now() + this.ttlMs,
+    });
+    return key;
+  }
+
+  take({ key, chatId, userId }) {
+    this.#prune();
+    const entry = this.entries.get(key);
+    if (!entry || entry.chatId !== String(chatId) || (entry.userId && entry.userId !== String(userId))) return null;
+    this.entries.delete(key);
+    return entry;
+  }
+
+  #prune() {
+    const now = this.now();
+    for (const [key, entry] of this.entries) if (entry.expiresAt <= now) this.entries.delete(key);
+  }
+}
+
+const pendingDelegates = new PendingDelegates();
 
 export async function notifyJobResult(telegram, job, { personalOps = null } = {}) {
   const messages = splitTelegramMessage(buildCompletionMessage(job));
@@ -1330,14 +1523,16 @@ export async function notifyJobResult(telegram, job, { personalOps = null } = {}
       kind: getBriefingKind(job.prompt),
       text: job.summary,
       recommendations: extractBriefingRecommendations(job.summary),
+      late: job.late === true,
       now: job.finishedAt ? new Date(job.finishedAt) : new Date(),
     });
   }
 
   for (const [index, text] of messages.entries()) {
-    const extra = index === 0 && job.replyToMessageId
-      ? { reply_parameters: { message_id: job.replyToMessageId } }
-      : {};
+    const extra = {
+      ...(index === 0 && job.replyToMessageId ? { reply_parameters: { message_id: job.replyToMessageId } } : {}),
+      ...(index === messages.length - 1 && job.replyMarkup ? { reply_markup: job.replyMarkup } : {}),
+    };
     const result = await telegram.sendMessage(
       job.chatId,
       text,
@@ -1400,6 +1595,7 @@ async function startCodexJob({
   operationMode = "default",
   unrestricted = false,
   modelTier = null,
+  delegateOffer = null,
 }) {
   const started = await jobs.startJob({
     chatId, userId, prompt, workspace, memories, resumeSession, replyToMessageId, operationMode,
@@ -1407,13 +1603,40 @@ async function startCodexJob({
     modelTier,
   });
   if (!started.accepted) {
-    await telegram.sendMessage(chatId, buildBusyMessage(started.job));
+    if (!delegateOffer) {
+      await telegram.sendMessage(chatId, buildBusyMessage(started.job));
+      return null;
+    }
+    const key = delegateOffer.store.add({ chatId, userId, text: delegateOffer.text, workspaceAlias: delegateOffer.workspaceAlias });
+    await telegram.sendMessage(chatId, `${buildBusyMessage(started.job)}\n아래 버튼을 누르면 이 요청을 새 대화의 백그라운드 작업으로 따로 실행합니다 (30분 동안 유효).`, {
+      reply_markup: { inline_keyboard: [[{ text: "백그라운드로 실행", callback_data: `bg:run:${key}` }]] },
+    });
     return null;
   }
   await telegram.sendMessage(chatId, buildAcceptedMessage(started.job));
   started.job.completion
     .then((job) => onJobSettled(job))
-    .catch(async (error) => telegram.sendMessage(chatId, `Job failed unexpectedly: ${error.message}`));
+    .catch(async (error) => telegram.sendMessage(chatId, `⚠️ 작업이 예기치 않게 실패했습니다: ${error.message}`));
+  return started.job;
+}
+
+async function startDelegateJob({ jobs, telegram, onJobSettled, chatId, userId, prompt, workspace, memories = [], unrestricted = false }) {
+  const started = await jobs.startJob({
+    chatId, userId, prompt, workspace, memories,
+    allowConcurrent: true,
+    jobKind: "delegate",
+    unrestricted,
+  });
+  if (!started.accepted) {
+    await telegram.sendMessage(chatId, `백그라운드 작업을 시작하지 못했습니다: ${started.reason || "거부됨"}`);
+    return null;
+  }
+  await telegram.sendMessage(chatId, `🧵 백그라운드 작업을 시작했습니다 · /job ${started.job.jobId}\n끝나면 결과를 보내드립니다. 중단: /delegate-cancel ${started.job.jobId}`);
+  started.job.completion
+    .then((job) => onJobSettled(job))
+    .catch(async (error) => {
+      await telegram.sendMessage(chatId, `⚠️ 백그라운드 작업이 예기치 않게 실패했습니다: ${error.message}`);
+    });
   return started.job;
 }
 

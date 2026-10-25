@@ -1,15 +1,19 @@
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import path from "node:path";
 import { listDocuments, serveDocument } from "./documents.js";
-import { compactRepoChecks, runAndStoreRepoChecks } from "./repo-checks.js";
+import { compactRepoChecks, runAndStoreRepoChecks, runSingleRepoCheck } from "./repo-checks.js";
 import { buildDashboardSnapshot } from "./dashboard.js";
-import { handleMessage } from "./router.js";
+import { handleMessage, splittingTelegram } from "./router.js";
 import { N8nManager } from "./n8n-manager.js";
 import { TradingManager } from "./trading-manager.js";
 import { PortfolioManager } from "./portfolio-manager.js";
 import { buildHealthReport } from "./health.js";
 import { createCodexLimitReader } from "./codex-rate-limits.js";
+import {
+  createEmoticonStudio, EMOTICON_CLIENT_JS, EMOTICON_CSS, EMOTICON_MAX_REQUEST_BYTES, EMOTICON_TAB_HTML,
+} from "./emoticon-studio.js";
 
 const DASHBOARD_COMMANDS = new Set([
   "/done", "/archive", "/snooze",
@@ -27,10 +31,19 @@ export function startDashboardServer({
   memories,
   approvals,
   personalOps,
+  onJobSettled = null,
+  jobResults = createJobResultStore(resolveJobResultsPath(config)),
+  repoCheckRunner = runSingleRepoCheck,
+  emoticonStudio = config.codexWorkspace
+    ? createEmoticonStudio({ config, jobs, workspaces, telegram, onJobSettled })
+    : null,
 }) {
   if (!config.dashboardEnabled) {
     return null;
   }
+  emoticonStudio?.load?.().catch((error) => console.error("Emoticon studio load failed:", error.message));
+  jobResults.load?.().catch((error) => console.error("Dashboard result store load failed:", error.message));
+  const rechecking = new Set();
   const n8n = new N8nManager({ port: config.n8nPort });
   const trading = new TradingManager({ port: config.tradingDashboardPort });
   const portfolio = new PortfolioManager();
@@ -42,6 +55,11 @@ export function startDashboardServer({
     if (!isAllowedHost(request.headers.host, config)) {
       response.writeHead(421, { "content-type": "text/plain; charset=utf-8" });
       response.end("Unknown host");
+      return;
+    }
+    // Reads expose inbox, briefings and results too, so the tailnet-user check covers every route.
+    if (!isTailnetUserAllowed(request, config)) {
+      sendJson(response, { ok: false, error: "이 Tailscale 계정은 대시보드를 사용할 수 없습니다." }, 403);
       return;
     }
     const url = new URL(request.url, `http://${request.headers.host || "127.0.0.1"}`);
@@ -57,12 +75,15 @@ export function startDashboardServer({
         schedules,
         workspaces,
         personalOps,
+        jobResults,
       });
+      snapshot.security = { tailnetUsersConfigured: tailnetUsers(config).length > 0 };
       snapshot.services = await inspectServices(config);
       snapshot.documents = await listDocuments(config);
       snapshot.codexRateLimits = await readCodexLimits();
       snapshot.claudeRateLimits = jobs.claudeLimits?.snapshot?.() ?? null;
-      snapshot.repoChecks = compactRepoChecks(personalOps?.getRepoChecks?.());
+      snapshot.repoChecks = compactRepoChecksWithAge(personalOps?.getRepoChecks?.(), rechecking);
+      snapshot.emoticons = emoticonStudio?.list?.() ?? [];
       if (healthCache.expiresAt <= Date.now()) {
         healthCache = { value: await buildHealthReport(config), expiresAt: Date.now() + 60_000 };
       }
@@ -71,17 +92,17 @@ export function startDashboardServer({
       return;
     }
 
+    // Every state-changing request passes the same origin, host and tailnet-user checks.
+    if (request.method === "POST" && !guardPost(request, response, config)) return;
+
     if (url.pathname === "/api/command" && request.method === "POST") {
-      if (!isSameOrigin(request, config)) {
-        sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
-        return;
-      }
       try {
         const body = await readJsonBody(request);
         const result = await executeDashboardCommand({
           command: body.command,
+          deliverToTelegram: body.deliverToTelegram !== false,
           config, telegram, jobs, processes, schedules, workspaces, sessions, memories, approvals, personalOps,
-          readCodexLimits,
+          readCodexLimits, onJobSettled, jobResults,
         });
         sendJson(response, result);
       } catch (error) {
@@ -90,11 +111,53 @@ export function startDashboardServer({
       return;
     }
 
-    if (url.pathname === "/api/repo-checks" && request.method === "POST") {
-      if (!isSameOrigin(request, config)) {
-        sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
-        return;
+    if (url.pathname === "/api/emoticon" && request.method === "POST") {
+      try {
+        if (!emoticonStudio) throw new Error("이모티콘 기능을 사용할 수 없습니다.");
+        const { id } = await emoticonStudio.create(await readJsonBody(request, EMOTICON_MAX_REQUEST_BYTES));
+        sendJson(response, { ok: true, id });
+      } catch (error) {
+        sendJson(response, { ok: false, error: error.message }, 400);
       }
+      return;
+    }
+
+    if (url.pathname === "/api/job-result" && request.method === "GET") {
+      const result = findJobResult(url.searchParams.get("id"), { config, jobs, jobResults });
+      if (!result) sendJson(response, { ok: false, error: "작업 결과를 찾을 수 없습니다." }, 404);
+      else sendJson(response, { ok: true, job: result });
+      return;
+    }
+
+    if (url.pathname === "/api/schedule-action" && request.method === "POST") {
+      await respondWith(response, async () => handleScheduleAction(await readJsonBody(request), { config, schedules }));
+      return;
+    }
+
+    if (url.pathname === "/api/usage-pause" && request.method === "POST") {
+      await respondWith(response, async () => handleUsagePause(await readJsonBody(request), { schedules }));
+      return;
+    }
+
+    if (url.pathname === "/api/briefing-feedback" && request.method === "POST") {
+      await respondWith(response, async () => handleBriefingFeedback(await readJsonBody(request), { config, personalOps }));
+      return;
+    }
+
+    if (url.pathname === "/api/briefing-resend" && request.method === "POST") {
+      await respondWith(response, async () => handleBriefingResend(await readJsonBody(request), { config, telegram, personalOps }));
+      return;
+    }
+
+    if (url.pathname === "/api/repo-check" && request.method === "POST") {
+      await respondWith(response, async () => {
+        const { done: _done, ...result } = startRepoRecheck(await readJsonBody(request), { config, personalOps, rechecking, repoCheckRunner });
+        return result;
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/repo-checks" && request.method === "POST") {
       try {
         const result = await runAndStoreRepoChecks({ config, personalOps });
         sendJson(response, { ok: true, repoChecks: compactRepoChecks(result) });
@@ -128,10 +191,6 @@ export function startDashboardServer({
     }
     const retryExecution = url.pathname.match(/^\/api\/n8n\/executions\/(\d+)\/retry$/);
     if (retryExecution && request.method === "POST") {
-      if (!isSameOrigin(request, config)) {
-        sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
-        return;
-      }
       try { sendJson(response, { ok: true, execution: await n8n.retryExecution(retryExecution[1]) }); }
       catch (error) { sendJson(response, { ok: false, error: error.message }, 502); }
       return;
@@ -139,14 +198,15 @@ export function startDashboardServer({
 
     const workflowAction = url.pathname.match(/^\/api\/n8n\/workflows\/([A-Za-z0-9_-]+)\/(publish|unpublish)$/);
     if (workflowAction && request.method === "POST") {
-      if (!isSameOrigin(request, config)) {
-        sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
-        return;
-      }
       try {
         const workflow = await n8n.setPublished(workflowAction[1], workflowAction[2] === "publish");
         sendJson(response, { ok: true, workflow });
       } catch (error) { sendJson(response, { ok: false, error: error.message }, 502); }
+      return;
+    }
+
+    if (url.pathname === "/api/emoticon-file" && request.method === "GET") {
+      await serveEmoticonFile(response, emoticonStudio?.resolveFile?.(url.searchParams.get("id"), url.searchParams.get("path")));
       return;
     }
 
@@ -172,7 +232,10 @@ export function startDashboardServer({
   return server;
 }
 
-export async function executeDashboardCommand({ command, config, telegram, jobs, processes, schedules, workspaces, sessions, memories, approvals, personalOps, readCodexLimits = null }) {
+export async function executeDashboardCommand({
+  command, config, telegram, jobs, processes, schedules, workspaces, sessions, memories, approvals, personalOps,
+  readCodexLimits = null, onJobSettled = null, jobResults = null, deliverToTelegram = true,
+}) {
   const text = String(command ?? "").trim();
   const name = text.split(/\s+/, 1)[0].toLowerCase();
   if (!DASHBOARD_COMMANDS.has(name)) {
@@ -225,11 +288,240 @@ export async function executeDashboardCommand({ command, config, telegram, jobs,
     schedules,
     approvals,
     personalOps,
-    onJobSettled: async (job) => { if (job?.summary) messages.push(String(job.summary)); },
+    onJobSettled: async (job) => {
+      if (!job) return;
+      // The bridge's settleJob records metrics, sessions and schedule results; Telegram delivery is opt-out per request.
+      if (deliverToTelegram === false) job.deliverToTelegram = false;
+      try {
+        if (onJobSettled) await onJobSettled(job);
+      } finally {
+        if (job.summary) messages.push(String(job.summary));
+        if (job.summary && jobResults?.record) {
+          await jobResults.record(job).catch((error) => console.error("Dashboard result persistence failed:", error.message));
+        }
+      }
+    },
     readCodexLimits,
   });
   const activeJob = jobs.getActiveJob?.(chatId);
   return { ok: true, messages, jobId: ["/done", "/archive", "/snooze", "/inbox", "/lab"].includes(name) ? null : activeJob?.jobId ?? null };
+}
+
+function guardPost(request, response, config) {
+  if (!isSameOrigin(request, config)) {
+    sendJson(response, { ok: false, error: "Cross-origin request rejected." }, 403);
+    return false;
+  }
+  if (!isTailnetUserAllowed(request, config)) {
+    sendJson(response, { ok: false, error: "이 Tailscale 계정은 대시보드 명령을 실행할 수 없습니다." }, 403);
+    return false;
+  }
+  return true;
+}
+
+function tailnetUsers(config = {}) {
+  return (config.dashboardTailnetUsers || []).map((row) => String(row).trim().toLowerCase()).filter(Boolean);
+}
+
+// With DASHBOARD_TAILNET_USERS set, a request through a MagicDNS name must come from a listed Tailscale login.
+// tailscale serve sets Tailscale-User-Login itself and strips a client-supplied copy.
+export function isTailnetUserAllowed(request, config = {}) {
+  const users = tailnetUsers(config);
+  if (!users.length) return true;
+  let hostname;
+  try {
+    hostname = new URL(`http://${request.headers.host}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  // The Host is client-controlled, so any sign of the tailscale serve proxy also requires a listed login.
+  const headers = request.headers;
+  const remote = String(request.socket?.remoteAddress || "127.0.0.1").replace(/^::ffff:/, "");
+  const proxied = hostname.endsWith(".ts.net")
+    || !["127.0.0.1", "::1"].includes(remote)
+    || ["tailscale-user-login", "tailscale-user-name", "x-forwarded-for", "x-forwarded-host"].some((name) => headers[name] !== undefined);
+  if (!proxied) return true;
+  const login = String(request.headers["tailscale-user-login"] || "").trim().toLowerCase();
+  return Boolean(login) && users.includes(login);
+}
+
+async function respondWith(response, handler) {
+  try {
+    const { status = 200, ...body } = await handler();
+    sendJson(response, body, status);
+  } catch (error) {
+    sendJson(response, { ok: false, error: error.message }, 400);
+  }
+}
+
+function dashboardChatId(config) {
+  return String(config.allowedChatIds?.[0] ?? "dashboard");
+}
+
+const SCHEDULE_ACTIONS = {
+  run: { method: "runNow", message: "곧 실행됩니다." },
+  skip: { method: "skipNext", message: "다음 실행을 한 번 건너뜁니다." },
+  remove: { method: "remove", message: "예약 작업을 삭제했습니다." },
+};
+
+export async function handleScheduleAction(body, { config, schedules, now = new Date() }) {
+  const id = String(body?.id ?? "").trim();
+  const action = SCHEDULE_ACTIONS[body?.action];
+  if (!id || !action || !Object.hasOwn(SCHEDULE_ACTIONS, body.action)) return { status: 400, ok: false, error: "id와 action(run, skip, remove)이 필요합니다." };
+  if (typeof schedules?.[action.method] !== "function") return { status: 501, ok: false, error: "이 작업을 지원하지 않습니다." };
+  const chatId = dashboardChatId(config);
+  const result = action.method === "remove"
+    ? await schedules.remove({ chatId, id })
+    : await schedules[action.method](id, { chatId, now });
+  if (!result) return { status: 404, ok: false, error: "예약 작업을 찾을 수 없습니다." };
+  if (result.removed) return { ok: true, action: body.action, message: "한 번만 실행되는 예약이라 삭제했습니다." };
+  const paused = body.action === "run" && schedules.getUsagePause?.(now);
+  return { ok: true, action: body.action, message: paused ? `${action.message} AI가 필요한 작업은 일시정지가 풀린 뒤 실행됩니다.` : action.message };
+}
+
+export async function handleUsagePause(body, { schedules }) {
+  if (body?.action !== "clear") return { status: 400, ok: false, error: "action은 clear만 지원합니다." };
+  if (typeof schedules?.clearUsagePause !== "function") return { status: 501, ok: false, error: "일시 중지 해제를 지원하지 않습니다." };
+  await schedules.clearUsagePause();
+  return { ok: true, message: "AI 예약 작업을 다시 실행합니다." };
+}
+
+const BRIEFING_FEEDBACK = { up: "interest", down: "skip", interest: "interest", skip: "skip", done: "done" };
+
+export async function handleBriefingFeedback(body, { config, personalOps }) {
+  const id = String(body?.id ?? "").trim();
+  const feedback = Object.hasOwn(BRIEFING_FEEDBACK, body?.feedback) ? BRIEFING_FEEDBACK[body.feedback] : null;
+  if (!id || !feedback) return { status: 400, ok: false, error: "id와 feedback(up, down)이 필요합니다." };
+  if (typeof personalOps?.setBriefingFeedback !== "function") return { status: 501, ok: false, error: "피드백 저장을 지원하지 않습니다." };
+  const entry = await personalOps.setBriefingFeedback({ chatId: dashboardChatId(config), id, feedback });
+  if (!entry) return { status: 404, ok: false, error: "브리핑을 찾을 수 없습니다." };
+  return { ok: true, feedback };
+}
+
+export async function handleBriefingResend(body, { config, telegram, personalOps, now = new Date() }) {
+  const id = String(body?.id ?? "").trim();
+  if (!id) return { status: 400, ok: false, error: "id가 필요합니다." };
+  const chatId = config.allowedChatIds?.[0];
+  if (!chatId || typeof telegram?.sendMessage !== "function") return { status: 400, ok: false, error: "텔레그램 채팅이 설정되지 않았습니다." };
+  const entry = (personalOps?.listBriefingHistory?.(chatId, { days: 30, limit: 200, now }) ?? []).find((row) => row.id === id);
+  if (!entry?.text) return { status: 404, ok: false, error: "브리핑을 찾을 수 없습니다." };
+  await splittingTelegram(telegram).sendMessage(chatId, entry.text);
+  return { ok: true, message: "텔레그램으로 다시 보냈습니다." };
+}
+
+// Runs one repository check in the background and merges it into the stored result.
+export function startRepoRecheck(body, { config, personalOps, rechecking, repoCheckRunner = runSingleRepoCheck, now = () => new Date() }) {
+  const name = String(body?.name ?? "").trim();
+  const stored = personalOps?.getRepoChecks?.();
+  if (!name || !stored?.repos?.some((row) => row.name === name)) return { status: 404, ok: false, error: "점검 기록에 없는 저장소입니다." };
+  if (rechecking.has(name)) return { status: 202, ok: true, running: true };
+  rechecking.add(name);
+  const done = (async () => {
+    try {
+      const startedAt = now();
+      const fresh = await repoCheckRunner(name, { config, now: startedAt });
+      const latest = personalOps.getRepoChecks?.();
+      if (!fresh || !latest?.repos) return;
+      const row = { ...fresh, checkedAt: startedAt.toISOString() };
+      await personalOps.setRepoChecks({ ...latest, repos: latest.repos.map((entry) => entry.name === name ? row : entry) });
+    } catch (error) {
+      console.error(`Repository recheck failed (${name}):`, error.message);
+    } finally {
+      rechecking.delete(name);
+    }
+  })();
+  return { status: 202, ok: true, started: true, done };
+}
+
+export function compactRepoChecksWithAge(result, rechecking = new Set()) {
+  const compact = compactRepoChecks(result);
+  if (!compact) return null;
+  compact.repos = compact.repos.map((row, index) => ({
+    ...row,
+    checkedAt: result.repos[index]?.checkedAt || result.checkedAt,
+    rechecking: rechecking.has(row.name),
+  }));
+  return compact;
+}
+
+function isFinishedStatus(status) {
+  return !["queued", "running"].includes(status);
+}
+
+export function findJobResult(rawId, { config, jobs, jobResults }) {
+  const id = String(rawId ?? "");
+  if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(id)) return null;
+  const chatId = dashboardChatId(config);
+  const live = jobs?.getJob?.(chatId, id);
+  if (live && isFinishedStatus(live.status) && live.summary) return jobResultRecord(live);
+  const stored = jobResults?.get?.(id);
+  return stored && stored.chatId === chatId ? stored : null;
+}
+
+function jobResultRecord(job, maxChars = 30_000) {
+  return {
+    jobId: String(job.jobId),
+    chatId: String(job.chatId),
+    kind: job.kind || "chat",
+    status: job.status,
+    provider: job.provider ?? null,
+    model: job.model ?? null,
+    prompt: String(job.prompt ?? "").replace(/\s+/g, " ").trim().slice(0, 200),
+    summary: String(job.summary ?? "").slice(0, maxChars),
+    startedAt: job.startedAt ?? null,
+    finishedAt: job.finishedAt ?? new Date().toISOString(),
+  };
+}
+
+function resolveJobResultsPath(config = {}) {
+  if (config.dashboardResultsPath) return config.dashboardResultsPath;
+  if (config.personalOpsStatePath) return path.join(path.dirname(config.personalOpsStatePath), "ai-workmate-dashboard-results.json");
+  return null;
+}
+
+// Full results of dashboard requests, kept so they stay viewable after a refresh or bridge restart.
+export function createJobResultStore(filePath, { limit = 100 } = {}) {
+  const entries = new Map();
+  let loaded = null;
+  let queue = Promise.resolve();
+  async function save() {
+    if (!filePath) return;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const temporary = `${filePath}.${process.pid}.tmp`;
+    await fs.writeFile(temporary, `${JSON.stringify({ version: 1, results: [...entries.values()] }, null, 2)}\n`, { mode: 0o600 });
+    await fs.rename(temporary, filePath);
+  }
+  const store = {
+    load() {
+      loaded ??= (async () => {
+        if (!filePath) return;
+        try {
+          const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
+          for (const row of parsed.results || []) {
+            if (row?.jobId && !entries.has(String(row.jobId))) entries.set(String(row.jobId), row);
+          }
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      })();
+      return loaded;
+    },
+    get(id) {
+      return entries.get(String(id)) ?? null;
+    },
+    async record(job) {
+      // Saving before the file is read would drop older results.
+      await store.load().catch(() => {});
+      const row = jobResultRecord(job);
+      entries.set(row.jobId, row);
+      const ordered = [...entries.values()].sort((a, b) => Date.parse(b.finishedAt) - Date.parse(a.finishedAt));
+      for (const old of ordered.slice(limit)) entries.delete(old.jobId);
+      queue = queue.catch(() => {}).then(save);
+      await queue;
+      return row;
+    },
+  };
+  return store;
 }
 
 function isSameOrigin(request, config = {}) {
@@ -302,6 +594,27 @@ function resolveChatId(url, config) {
   return url.searchParams.get("chatId") || config.allowedChatIds[0] || "default";
 }
 
+const EMOTICON_CONTENT_TYPES = { ".png": "image/png", ".webp": "image/webp", ".zip": "application/zip", ".txt": "text/plain; charset=utf-8" };
+
+async function serveEmoticonFile(response, filePath) {
+  let data = null;
+  try {
+    if (filePath) data = await fs.readFile(filePath);
+  } catch {
+    data = null;
+  }
+  if (!data) {
+    response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    response.end("Not found");
+    return;
+  }
+  const extension = path.extname(filePath).toLowerCase();
+  const headers = { "content-type": EMOTICON_CONTENT_TYPES[extension] || "application/octet-stream", "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" };
+  if (extension === ".zip") headers["content-disposition"] = `attachment; filename="${path.basename(filePath)}"`;
+  response.writeHead(200, headers);
+  response.end(data);
+}
+
 function sendJson(response, data, statusCode = 200) {
   response.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
@@ -321,11 +634,11 @@ function sendHtml(response, html) {
 export function renderDashboardHtml(config) {
   const chatId = escapeHtml(config.allowedChatIds[0] || "");
   return `<!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Workmate Dashboard</title>
+  <title>AI Workmate 대시보드</title>
   <style>
     :root {
       color-scheme: light;
@@ -504,6 +817,10 @@ export function renderDashboardHtml(config) {
     .doc-body .md-table { overflow-x: auto; } .doc-body table { border-collapse: collapse; font-size: 14px; } .doc-body th, .doc-body td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
     .doc-body a { color: var(--accent); }
     @media (min-width: 821px) { .doc-viewer-panel { margin: 24px 0; height: calc(100% - 48px); border-radius: 10px; overflow: hidden; } }
+    .briefing-full { max-height: 60vh; }
+    .lab-actions button[aria-pressed="true"] { border-color: var(--accent); background: #e9f6f4; color: var(--accent); }
+    .overdue { color: var(--bad); font-weight: 700; }
+    .doc-viewer-bar .action[hidden] { display: none; }
     .lab-result { margin-top:8px; padding:9px; background:#f2f5f7; border-radius:7px; white-space:pre-wrap; max-height:220px; overflow:auto; }
     .inline-form { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; padding: 12px; }
     .inline-form input, .inline-form select { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; background: white; }
@@ -529,18 +846,20 @@ export function renderDashboardHtml(config) {
       .portfolio-table td::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; font-weight: 400; }
       .portfolio-table td:first-child::before { display: none; }
     }
+${EMOTICON_CSS}
   </style>
 </head>
 <body>
   <main class="wrap">
     <div class="dashboard-title"><div><h1>AI Workmate</h1><p>오늘의 선택과 자동화를 한곳에서 관리합니다.</p></div></div>
     <nav class="tabs" aria-label="대시보드 화면">
-      <button class="tab active" data-tab="today">오늘</button><button class="tab" data-tab="lab">AI 실험실</button><button class="tab" data-tab="automation">자동화</button><button class="tab" data-tab="trading">Trading</button><button class="tab" data-tab="system">시스템</button><button class="tab" data-tab="settings">설정</button>
+      <button class="tab active" data-tab="today">오늘</button><button class="tab" data-tab="lab">AI 실험실</button><button class="tab" data-tab="automation">자동화</button><button class="tab" data-tab="emoticon">이모티콘</button><button class="tab" data-tab="trading">트레이딩</button><button class="tab" data-tab="system">시스템</button><button class="tab" data-tab="settings">설정</button>
     </nav>
     <div id="lastUpdated" class="last-updated">불러오는 중…</div>
 
     <div class="tab-panel" data-panel="today">
-      <section class="section" style="margin-bottom:14px"><h2>AI Workmate에게 요청</h2><form id="askForm"><div class="ask-form"><textarea id="askInput" aria-label="AI Workmate에게 요청할 내용" placeholder="질문이나 작업을 요청하세요. 예: 로컬 LLM 평가 방법을 조사해줘"></textarea><button id="askSubmit" type="submit">실행</button></div><label style="display:block;padding:0 12px 12px"><input id="askResearch" type="checkbox"> 조사 보고서로 남기기</label><p class="meta" style="padding:0 12px">선택하면 조사 결과를 AI 실험실에 기록하고 실습·구현·추가 조사로 이어갈 수 있습니다.</p></form><pre id="askOutput" class="command-output" aria-live="polite" hidden>요청 결과가 여기에 표시됩니다.</pre></section>
+      <section id="statusLine" class="section" style="margin-bottom:14px" hidden><h2>확인 필요</h2><div id="statusItems" class="attention-list"></div></section>
+      <section class="section" style="margin-bottom:14px"><h2>AI Workmate에게 요청</h2><form id="askForm"><div class="ask-form"><textarea id="askInput" aria-label="AI Workmate에게 요청할 내용" placeholder="질문이나 작업을 요청하세요. 예: 로컬 LLM 평가 방법을 조사해줘"></textarea><button id="askSubmit" type="submit">실행</button></div><label style="display:block;padding:0 12px 6px"><input id="askTelegram" type="checkbox" checked> 텔레그램으로도 받기</label><label style="display:block;padding:0 12px 12px"><input id="askResearch" type="checkbox"> 조사 보고서로 남기기</label><p class="meta" style="padding:0 12px">선택하면 조사 결과를 AI 실험실에 기록하고 실습·구현·추가 조사로 이어갈 수 있습니다.</p></form><pre id="askOutput" class="command-output" aria-live="polite" hidden>요청 결과가 여기에 표시됩니다.</pre></section>
       <section class="hero-grid"><div class="section"><h2>결과와 결정</h2><div id="attention" class="attention-list"><div class="empty">불러오는 중…</div></div></div><div class="section"><h2>오늘</h2><div id="today" class="today-grid"><div class="empty">불러오는 중…</div></div></div></section>
       <section class="section" style="margin-bottom:14px"><h2>할 일 · Inbox</h2><form id="inboxForm" class="inline-form"><select id="inboxType" aria-label="기록 종류"><option value="task">할 일</option><option value="idea">아이디어</option><option value="read">읽기</option></select><input id="inboxText" aria-label="할 일 내용" placeholder="빠르게 기록할 내용"><button>추가</button></form><pre id="quickOutput" class="command-output" hidden>Inbox 처리 결과가 여기에 표시됩니다.</pre><div id="inbox" class="simple-list"></div></section>
       <section class="grid"><div class="section"><h2>최근 브리핑</h2><div id="briefings" class="simple-list"></div></div><div class="section"><h2>다음 일정</h2><div id="nextSchedules"></div></div></section>
@@ -560,9 +879,10 @@ export function renderDashboardHtml(config) {
 
     <div class="tab-panel" data-panel="trading" hidden><section class="section" style="margin-bottom:14px"><h2>오늘의 dry-run</h2><div id="trading" class="trading-grid"><div class="empty">불러오는 중…</div></div><div id="tradingDetail"></div><div id="tradingPositions"></div></section><section class="section"><h2>내 보유자산</h2><div id="portfolio"><div class="empty">불러오는 중…</div></div></section></div>
 
-    <div class="tab-panel" data-panel="system" hidden><section class="section"><h2>Mac mini와 서비스</h2><div id="services"></div><div id="system"></div></section><section class="section" style="margin-top:14px"><h2>저장소와 사진 백업</h2><div id="storage" class="system-list"></div></section><section class="section" style="margin-top:14px"><div class="lab-header"><h2>코드 저장소 점검</h2><button id="runRepoChecks" class="action" type="button">지금 점검</button></div><p class="lab-description">하네스 audit·검증 증거·유지보수 리뷰와 GitHub 공개 전 차단 항목을 읽기 전용으로 확인합니다. 매일 아침 자동 실행됩니다.</p><div id="repoChecks" class="simple-list"><div class="empty">불러오는 중…</div></div></section></div>
+    <div class="tab-panel" data-panel="system" hidden><section class="section"><h2>Mac mini와 서비스</h2><div id="services"></div><div id="system"></div></section><section id="storageSection" class="section" style="margin-top:14px"><h2>저장소와 사진 백업</h2><div id="storage" class="system-list"></div></section><section class="section" style="margin-top:14px"><div class="lab-header"><h2>코드 저장소 점검</h2><button id="runRepoChecks" class="action" type="button">지금 점검</button></div><p class="lab-description">하네스 audit·검증 증거·유지보수 리뷰와 GitHub 공개 전 차단 항목을 읽기 전용으로 확인합니다. 매일 아침 자동 실행됩니다.</p><div id="repoChecks" class="simple-list"><div class="empty">불러오는 중…</div></div></section></div>
 
-    <div class="tab-panel" data-panel="settings" hidden><section class="section"><h2>추천 선호</h2><div id="preferences" class="simple-list"></div><form id="preferenceForm" class="inline-form"><select id="preferenceType"><option value="like">선호</option><option value="avoid">피하기</option></select><input id="preferenceText" placeholder="예: 평일 장거리 외출 추천"><button>저장</button></form></section><section class="section" style="margin-top:14px"><h2>사용량과 품질</h2><div id="quality" class="today-grid"></div></section><details class="section" style="margin-top:14px"><summary style="padding:14px;font-weight:700;cursor:pointer">고급 명령</summary><div id="commands" class="command-grid"></div><pre id="commandOutput" class="command-output">명령을 선택하세요.</pre></details></div>
+    <div class="tab-panel" data-panel="settings" hidden><section class="section" style="margin-bottom:14px"><h2>접근 보안</h2><div id="securityNotice" class="attention-list"><div class="empty">불러오는 중…</div></div></section><section class="section"><h2>추천 선호</h2><div id="preferences" class="simple-list"></div><form id="preferenceForm" class="inline-form"><select id="preferenceType"><option value="like">선호</option><option value="avoid">피하기</option></select><input id="preferenceText" placeholder="예: 평일 장거리 외출 추천"><button>저장</button></form></section><section class="section" style="margin-top:14px"><h2>사용량과 품질</h2><div id="quality" class="today-grid"></div></section><details class="section" style="margin-top:14px"><summary style="padding:14px;font-weight:700;cursor:pointer">고급 명령</summary><div id="commands" class="command-grid"></div><pre id="commandOutput" class="command-output">명령을 선택하세요.</pre></details></div>
+    ${EMOTICON_TAB_HTML}
   </main>
   <div id="docViewer" class="doc-viewer" hidden><div class="doc-viewer-panel" role="dialog" aria-modal="true" aria-labelledby="docViewerTitle"><div class="doc-viewer-bar"><button id="docViewerClose" class="action" type="button">닫기</button><strong id="docViewerTitle"></strong><a id="docViewerDownload" class="action" href="#">다운로드</a></div><article id="docViewerBody" class="doc-body"></article></div></div>
   <script>
@@ -605,13 +925,13 @@ export function renderDashboardHtml(config) {
         return;
       }
       workflows.innerHTML = data.workflows.length ? data.workflows.map(row =>
-        '<div class="workflow-row"><div><strong>' + escapeText(row.name) + '</strong><div class="meta">' + badge(row.active ? "published" : "draft") + ' · ' + escapeText(formatTime(row.updatedAt)) + '</div></div><button class="action ' + (row.active ? "unpublish" : "publish") + '" data-workflow="' + escapeText(row.id) + '" data-action="' + (row.active ? "unpublish" : "publish") + '">' + (row.active ? "Unpublish" : "Publish") + '</button></div>'
+        '<div class="workflow-row"><div><strong>' + escapeText(row.name) + '</strong><div class="meta">' + badge(row.active ? "published" : "draft") + ' · ' + escapeText(formatTime(row.updatedAt)) + '</div></div><button class="action ' + (row.active ? "unpublish" : "publish") + '" data-workflow="' + escapeText(row.id) + '" data-action="' + (row.active ? "unpublish" : "publish") + '">' + (row.active ? "게시 중지" : "게시") + '</button></div>'
       ).join("") : '<div class="empty">워크플로우가 없습니다.</div>';
       executions.innerHTML = data.executions.length ? groupExecutions(data.executions).map(group =>
         '<div class="workflow-row"><div><strong>' + escapeText(group.workflowName) + '</strong><div class="meta">최근 ' + escapeText(formatTime(group.latest)) + (group.count > 1 ? ' · ' + group.count + '회 (' + escapeText(formatTime(group.earliest)) + '부터)' : '') + '</div></div>' + badge(group.status) + '</div>'
       ).join("") : '<div class="empty">최근 실행이 없습니다.</div>';
       failures.innerHTML = data.failures.length ? data.failures.map(row =>
-        '<div class="workflow-row"><div><strong>' + escapeText(row.workflowName) + '</strong><div class="meta">#' + escapeText(row.id) + ' · ' + escapeText(formatTime(row.startedAt)) + '</div><button class="action" data-detail="' + escapeText(row.id) + '">오류 상세</button></div><button class="action publish" data-retry="' + escapeText(row.id) + '">Retry</button></div>'
+        '<div class="workflow-row"><div><strong>' + escapeText(row.workflowName) + '</strong><div class="meta">#' + escapeText(row.id) + ' · ' + escapeText(formatTime(row.startedAt)) + '</div><button class="action" data-detail="' + escapeText(row.id) + '">오류 상세</button></div><button class="action publish" data-retry="' + escapeText(row.id) + '">재시도</button></div>'
       ).join("") : '<div class="attention good">최근 실패한 자동화가 없습니다.</div>';
     }
 
@@ -678,7 +998,16 @@ export function renderDashboardHtml(config) {
       const next = dashboard.schedules?.[0];
       const queued = (dashboard.experiments || []).filter(row => row.status === "queued").length;
       document.getElementById("today").innerHTML = metric("결과 준비", ready.length + "건") + metric("실험 대기", queued + "건") + metric("읽기·할 일", (dashboard.personal?.openInbox || 0) + "건") + metric("다음 자동화", next ? formatTime(next.nextRunAt) : "-");
-      document.getElementById("quality").innerHTML = metric("Claude 작업", (dashboard.usage?.claudeJobs || 0) + "건") + metric("Codex 작업 · 폴백", (dashboard.usage?.codexJobs || 0) + "건 · " + (dashboard.usage?.fallbacks || 0) + "건") + metric("실패 · 품질 재시도", (dashboard.usage?.failures || 0) + "건 · " + (dashboard.usage?.qualityRetries || 0) + "건") + metric("로컬 작업", (dashboard.usage?.localJobs || 0) + "건") + metric("입력 토큰", formatInteger(dashboard.usage?.inputTokens || 0)) + metric("브리핑 형식 검사 · 사실 정확성 미평가", dashboard.briefingQuality?.averageScore == null ? "-" : dashboard.briefingQuality.averageScore + "/100");
+      document.getElementById("quality").innerHTML = metric("Claude 작업", (dashboard.usage?.claudeJobs || 0) + "건") + metric("Codex 작업 · 폴백", (dashboard.usage?.codexJobs || 0) + "건 · " + (dashboard.usage?.fallbacks || 0) + "건") + metric("실패 · 품질 재시도", (dashboard.usage?.failures || 0) + "건 · " + (dashboard.usage?.qualityRetries || 0) + "건") + metric("로컬 작업", (dashboard.usage?.localJobs || 0) + "건") + metric("입력 토큰", formatInteger(dashboard.usage?.inputTokens || 0)) + renderBriefingHealth(dashboard);
+    }
+    // Delivery and feedback health replaces the format score; the score stays only as a fallback.
+    function renderBriefingHealth(dashboard) {
+      const health = dashboard.briefingHealth;
+      if (!health) return metric("브리핑 형식 검사 · 사실 정확성 미평가", dashboard.briefingQuality?.averageScore == null ? "-" : dashboard.briefingQuality.averageScore + "/100");
+      const rate = Number(health.feedbackRate || 0);
+      const percent = Math.round(rate <= 1 ? rate * 100 : rate);
+      return metric("브리핑 · 최근 " + (health.days || 14) + "일", (health.briefings || 0) + "건 · 지연 " + (health.lateDeliveries || 0) + "건") +
+        metric("추천 피드백", (health.feedbackCount || 0) + "건 · " + percent + "%") + metric("로컬 브리핑 실패", (health.localFailures || 0) + "건");
     }
 
     let tradingDetailKey = null;
@@ -729,7 +1058,8 @@ export function renderDashboardHtml(config) {
       const button = event.target.closest("button[data-workflow]");
       if (!button) return;
       const action = button.dataset.action;
-      if (!window.confirm(button.closest(".workflow-row").querySelector("strong").textContent + "을(를) " + action + " 할까요?")) return;
+      const actionLabel = action === "publish" ? "게시" : "게시 중지";
+      if (!window.confirm(button.closest(".workflow-row").querySelector("strong").textContent + "을(를) " + actionLabel + " 할까요?")) return;
       button.disabled = true;
       button.textContent = "처리 중…";
       try {
@@ -737,7 +1067,7 @@ export function renderDashboardHtml(config) {
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "처리 실패");
         await loadN8n();
-      } catch (error) { window.alert(error.message); button.disabled = false; button.textContent = action; }
+      } catch (error) { window.alert(error.message); button.disabled = false; button.textContent = actionLabel; }
     });
 
     document.getElementById("failureList").addEventListener("click", async event => {
@@ -762,7 +1092,7 @@ export function renderDashboardHtml(config) {
         if (!response.ok || !data.ok) throw new Error(data.error || "재시도 실패");
         window.alert("실행 #" + data.execution.id + "으로 재시도했습니다.");
         await loadN8n();
-      } catch (error) { window.alert(error.message); button.disabled = false; button.textContent = "Retry"; }
+      } catch (error) { window.alert(error.message); button.disabled = false; button.textContent = "재시도"; }
     });
 
     function formatTime(value) {
@@ -796,30 +1126,72 @@ export function renderDashboardHtml(config) {
       document.getElementById("services").innerHTML = renderServices(data.services || []);
       document.getElementById("system").innerHTML = renderSystem(data.system);
       document.getElementById("commands").innerHTML = renderCommands();
-      document.getElementById("briefings").innerHTML = renderBriefings((data.recentBriefings || []).slice(0, 5));
+      setHtmlKeepingOpen(document.getElementById("briefings"), renderBriefings((data.recentBriefings || []).slice(0, 5)), "data-briefing-id");
+      const statusHtml = renderStatusLine(data);
+      document.getElementById("statusItems").innerHTML = statusHtml;
+      document.getElementById("statusLine").hidden = !statusHtml;
+      document.getElementById("securityNotice").innerHTML = renderSecurityNotice(data.security);
       document.getElementById("inbox").innerHTML = renderInbox(data.inbox || []);
       document.getElementById("preferences").innerHTML = renderPreferences(data.preferences || []);
       updateExperiments(data.experiments || []);
       document.getElementById("nextSchedules").innerHTML = renderSchedules((data.schedules || []).slice(0, 3));
-      document.getElementById("schedules").innerHTML = renderSchedules(data.schedules || []);
+      document.getElementById("schedules").innerHTML = renderSchedules(data.schedules || [], true);
       document.getElementById("recentJobs").innerHTML = renderJobs(data.recentJobs || [], "최근 AI 작업이 없습니다.");
       document.getElementById("processes").innerHTML = renderProcesses(data.processes || []);
       document.getElementById("storage").innerHTML = renderStorage(data.health);
+      document.getElementById("storageSection").hidden = Boolean(data.health) && !data.health.storage?.configured && !data.health.photoBackup?.configured;
       document.getElementById("repoChecks").innerHTML = renderRepoChecks(data.repoChecks);
+      setHtmlKeepingOpen(document.getElementById("emoticons"), renderEmoticons(data.emoticons || []), "data-emoticon-id");
       [document.getElementById("commandOutput"), document.getElementById("askOutput"), document.getElementById("quickOutput"), document.getElementById("labOutput")].forEach(output => updateJobOutput(output, data));
     }
 
     function renderBriefings(rows) {
       if (!rows.length) return '<div class="empty">최근 브리핑이 없습니다.</div>';
       const labels = { morning: "모닝", evening: "이브닝", weekly: "주간", aiTrend: "AI 트렌드" };
-      return rows.map(row => '<div class="simple-row"><strong>' + escapeText(labels[row.kind] || row.kind) + '</strong><span class="meta"> · ' + escapeText(formatTime(row.sentAt)) + '</span><div class="meta">' + escapeText(briefingPreview(row.text)) + '</div></div>').join("");
+      return rows.map(row => '<div class="simple-row" data-briefing-id="' + escapeText(row.id) + '"><details><summary style="cursor:pointer"><strong>' + escapeText(labels[row.kind] || row.kind) + '</strong><span class="meta"> · ' + escapeText(formatTime(row.sentAt)) + ' · 펼쳐서 전체 보기</span><div class="meta">' + escapeText(briefingPreview(row.text)) + '</div></summary><div class="lab-result briefing-full">' + escapeText(row.text) + '</div></details>' +
+        '<div class="lab-actions"><button type="button" data-briefing-action="up" aria-label="도움이 됐어요" aria-pressed="' + (row.feedback === "interest") + '">👍</button><button type="button" data-briefing-action="down" aria-label="별로였어요" aria-pressed="' + (row.feedback === "skip") + '">👎</button><button type="button" data-briefing-action="resend">다시 보내기</button></div></div>').join("");
     }
     function briefingPreview(text) {
       const lines = String(text || "").split("\\n").map(line => line.trim()).filter(Boolean).slice(1);
       const bullets = lines.filter(line => /^[•\\-*]\\s*/.test(line)).map(line => line.replace(/^[•\\-*]\\s*/, ""));
       return (bullets.length ? bullets : lines).slice(0, 2).join(" · ");
     }
-    function renderInbox(rows) { return rows.length ? rows.map(row => '<div class="simple-row" data-inbox-id="' + escapeText(row.id) + '"><strong>' + escapeText(row.text) + '</strong><div class="meta">' + escapeText(row.type) + ' · ' + escapeText(formatTime(row.createdAt)) + '</div><div class="lab-actions"><button data-inbox-action="done">완료</button><button data-inbox-action="archive">보관</button></div></div>').join("") : '<div class="empty">열린 항목이 없습니다.</div>'; }
+    function renderInbox(rows) {
+      if (!rows.length) return '<div class="empty">열린 항목이 없습니다.</div>';
+      const types = { task: "할 일", idea: "아이디어", read: "읽기", note: "메모" };
+      return rows.map(row => {
+        const waiting = row.daysWaiting == null ? formatTime(row.createdAt) : row.daysWaiting === 0 ? "오늘 추가" : row.daysWaiting + "일째";
+        const due = row.dueLabel ? ' · <span class="' + (row.overdue ? "overdue" : "") + '">마감 ' + escapeText(row.dueLabel) + (row.overdue ? " (지남)" : "") + '</span>' : '';
+        return '<div class="simple-row" data-inbox-id="' + escapeText(row.id) + '"><strong>' + escapeText(row.text) + '</strong><div class="meta">' + escapeText(types[row.type] || row.type) + ' · ' + escapeText(waiting) + due + '</div><div class="lab-actions"><button data-inbox-action="done">완료</button><button data-inbox-action="snooze" title="24시간 뒤에 다시 표시">미루기</button><button data-inbox-action="archive">보관</button></div></div>';
+      }).join("");
+    }
+    function setHtmlKeepingOpen(container, html, key) {
+      if (container.renderedHtml === html) return;
+      const open = new Set(Array.from(container.querySelectorAll("[" + key + "]")).filter(row => row.querySelector("details")?.open).map(row => row.getAttribute(key)));
+      container.innerHTML = html;
+      container.renderedHtml = html;
+      container.querySelectorAll("[" + key + "]").forEach(row => {
+        const details = row.querySelector("details");
+        if (details && open.has(row.getAttribute(key))) details.open = true;
+      });
+    }
+    function renderStatusLine(data) {
+      const items = [];
+      const pause = data.usagePause;
+      if (pause) {
+        items.push('<div class="attention"><strong>AI 예약 작업 일시 중지</strong> · ' + escapeText((pause.untilLabel || formatTime(pause.until)) + "까지") + (pause.reason ? '<br>' + escapeText(pause.reason) : '') +
+          '<div class="meta">로컬 브리핑과 영어 학습은 계속 보냅니다.</div><div class="lab-actions"><button type="button" data-usage-pause="clear">해제</button></div></div>');
+      }
+      (data.failingSchedules || []).forEach(row => items.push('<div class="attention" data-schedule-id="' + escapeText(row.id) + '"><strong>' + escapeText(row.name) + ' 실패' + (row.failureCount ? ' ' + escapeText(row.failureCount) + '회' : '') + '</strong><br>' + escapeText(row.lastError) +
+        '<div class="lab-actions"><button type="button" data-schedule-action="run">지금 실행</button></div></div>'));
+      return items.join("");
+    }
+    function renderSecurityNotice(security) {
+      if (!security) return '';
+      return security.tailnetUsersConfigured
+        ? '<div class="attention good">Tailscale 주소로는 DASHBOARD_TAILNET_USERS에 등록된 계정만 명령을 실행할 수 있습니다.</div>'
+        : '<div class="attention"><strong>DASHBOARD_TAILNET_USERS가 설정되지 않았습니다.</strong><br>같은 tailnet의 모든 기기가 이 대시보드에서 명령을 실행할 수 있습니다. .env에 허용할 Tailscale 로그인을 쉼표로 구분해 지정하세요.</div>';
+    }
     function updateExperiments(rows) {
       const container = document.getElementById("experiments");
       const archived = rows.filter(row => ["archived", "discarded"].includes(row.status));
@@ -856,14 +1228,24 @@ export function renderDashboardHtml(config) {
       if (!health) return '<div class="empty">저장소 상태를 불러오는 중입니다.</div>';
       const storage = health.storage || {};
       const photos = health.photoBackup || {};
-      return '<div><span class="label">외장 SSD</span><div>' + escapeText(storage.ok ? storage.path + " · " + formatBytes(storage.availableBytes) + " 여유" : storage.configured ? storage.error : "설정 안 됨") + '</div></div><div><span class="label">사진 원본 백업</span><div>' + escapeText(photos.ok ? (photos.latestModifiedAt ? "최근 파일 " + formatTime(photos.latestModifiedAt) : "폴더 비어 있음") : photos.configured ? photos.error : "설정 안 됨") + '</div></div>';
+      // Checks that were never configured are hidden instead of shown as "not configured".
+      const rows = [];
+      if (storage.configured) rows.push('<div><span class="label">외장 SSD</span><div>' + escapeText(storage.ok ? storage.path + " · " + formatBytes(storage.availableBytes) + " 여유" : storage.error) + '</div></div>');
+      if (photos.configured) rows.push('<div><span class="label">사진 원본 백업</span><div>' + escapeText(photos.ok ? (photos.latestModifiedAt ? "최근 파일 " + formatTime(photos.latestModifiedAt) : "폴더 비어 있음") : photos.error) + '</div></div>');
+      return rows.join("") || '<div class="meta">설정된 저장소 점검이 없습니다.</div>';
     }
 
     function renderRepoChecks(result) {
       if (!result?.repos?.length) return '<div class="empty">아직 점검 기록이 없습니다. 지금 점검을 눌러 보세요.</div>';
-      return result.repos.map(row => '<div class="simple-row"><div><strong>' + escapeText(row.name) + '</strong> <span class="pill ' + (row.issues.length ? 'failed' : 'completed') + '">' + escapeText(row.issues.length ? '확인 필요 ' + row.issues.length : '이상 없음') + '</span></div>' +
-        (row.issues.length ? '<div class="meta">' + row.issues.map(escapeText).join('<br>') + '</div>' : '') +
-        '<div class="meta">' + escapeText([row.harness ? 'harness' : 'harness 없음', row.git ? 'git' : 'git 아님'].join(' · ')) + '</div></div>').join('') +
+      return result.repos.map(row => {
+        const checkedAt = row.checkedAt || result.checkedAt;
+        const checkedTime = Date.parse(checkedAt);
+        const stale = !Number.isFinite(checkedTime) || Date.now() - checkedTime > 24 * 60 * 60 * 1000;
+        return '<div class="simple-row" data-repo-name="' + escapeText(row.name) + '"><div><strong>' + escapeText(row.name) + '</strong> <span class="pill ' + (row.issues.length ? 'failed' : 'completed') + '">' + escapeText(row.issues.length ? '확인 필요 ' + row.issues.length : '이상 없음') + '</span>' + (stale ? ' <span class="pill stopping">오래됨</span>' : '') + '</div>' +
+          (row.issues.length ? '<div class="meta">' + row.issues.map(escapeText).join('<br>') + '</div>' : '') +
+          '<div class="meta">' + escapeText([row.harness ? 'harness' : 'harness 없음', row.git ? 'git' : 'git 아님', '점검 ' + formatTime(checkedAt)].join(' · ')) + '</div>' +
+          (row.rechecking ? '<div class="lab-actions"><span class="meta">재점검 중…</span></div>' : stale ? '<div class="lab-actions"><button type="button" data-repo-recheck="' + escapeText(row.name) + '">재점검</button></div>' : '') + '</div>';
+      }).join('') +
         '<div class="meta" style="padding:8px 12px">마지막 점검 ' + escapeText(formatTime(result.checkedAt)) + ' · 파일 위치는 Telegram /publish-check 저장소이름</div>';
     }
 
@@ -883,16 +1265,21 @@ export function renderDashboardHtml(config) {
       const content = String(text || '') + ' ' + artifacts.map(item => typeof item === 'string' ? item : item.path).join(' ');
       return availableDocuments.filter(file => content.includes(file.path) || content.includes(file.absolutePath));
     }
+    function statusLabel(status) {
+      const labels = { completed: "완료", failed: "실패", running: "실행 중", queued: "대기", waiting: "대기", cancelled: "취소", canceled: "취소", exited: "종료", stopping: "중지 중", crashed: "비정상 종료", published: "게시됨", draft: "초안", success: "성공", error: "오류", new: "새 실행", online: "온라인", offline: "오프라인" };
+      return labels[status] || status;
+    }
     function updateJobOutput(output, data) {
       const jobId = output.dataset.jobId;
       if (jobId) {
         const job = [data.activeJob, ...data.runningDelegates, ...data.recentJobs].filter(Boolean).find(row => row.jobId === jobId);
         if (job?.status === "completed" || job?.status === "failed" || job?.status === "cancelled") {
-          output.textContent = jobId + " · " + job.status + "\\n\\n" + job.summary;
+          output.textContent = jobId + " · " + statusLabel(job.status) + "\\n\\n" + job.summary;
           output.insertAdjacentHTML("beforeend", renderDocumentLinks(documentsForText(job.summary)));
+          if (job.summaryTruncated) output.insertAdjacentHTML("beforeend", '<div class="lab-actions"><button type="button" class="action" data-job-result="' + escapeText(jobId) + '">전체 결과 보기</button></div>');
           delete output.dataset.jobId;
         } else if (job) {
-          output.textContent = jobId + " · " + job.status + "…";
+          output.textContent = jobId + " · " + statusLabel(job.status) + "…";
         }
       }
     }
@@ -901,13 +1288,13 @@ export function renderDashboardHtml(config) {
       const host = window.location.hostname;
       return '<div class="service-grid">' + rows.map(row => {
         const href = row.id === "ai-workmate" ? "/" : row.id === "n8n" ? "#workflowList" : "http://" + host + ":" + row.port + "/";
-        return '<a class="service-card" href="' + escapeText(href) + '"><div class="service-title"><span>' + escapeText(row.name) + '</span><span><i class="dot ' + escapeText(row.status) + '"></i> ' + escapeText(row.status) + '</span></div><div class="meta">' + escapeText(row.description) + ' · :' + escapeText(row.port) + '</div></a>';
+        return '<a class="service-card" href="' + escapeText(href) + '"><div class="service-title"><span>' + escapeText(row.name) + '</span><span><i class="dot ' + escapeText(row.status) + '"></i> ' + escapeText(statusLabel(row.status)) + '</span></div><div class="meta">' + escapeText(row.description) + ' · :' + escapeText(row.port) + '</div></a>';
       }).join("") + '</div>';
     }
 
     function renderSystem(system) {
       if (!system) return "";
-      return '<div class="system-list"><div><span class="label">Host</span><div>' + escapeText(system.hostname) + '</div></div><div><span class="label">Platform</span><div>' + escapeText(system.platform) + '</div></div><div><span class="label">CPU</span><div>' + escapeText(system.cpuCount) + ' cores · load ' + escapeText(system.load1) + ' / ' + escapeText(system.load5) + '</div></div><div><span class="label">' + (system.memoryMetric === "pressure" ? "Memory pressure" : "Memory") + '</span><div>' + escapeText(formatBytes(system.memoryUsedBytes)) + ' / ' + escapeText(formatBytes(system.memoryTotalBytes)) + ' (' + escapeText(system.memoryUsedPercent) + '%)</div></div><div><span class="label">Mac uptime</span><div>' + escapeText(system.systemUptime) + '</div></div><div><span class="label">Bridge uptime</span><div>' + escapeText(system.bridgeUptime) + '</div></div></div>';
+      return '<div class="system-list"><div><span class="label">호스트</span><div>' + escapeText(system.hostname) + '</div></div><div><span class="label">플랫폼</span><div>' + escapeText(system.platform) + '</div></div><div><span class="label">CPU</span><div>' + escapeText(system.cpuCount) + '코어 · 부하 ' + escapeText(system.load1) + ' / ' + escapeText(system.load5) + '</div></div><div><span class="label">' + (system.memoryMetric === "pressure" ? "메모리 압력" : "메모리") + '</span><div>' + escapeText(formatBytes(system.memoryUsedBytes)) + ' / ' + escapeText(formatBytes(system.memoryTotalBytes)) + ' (' + escapeText(system.memoryUsedPercent) + '%)</div></div><div><span class="label">Mac 가동 시간</span><div>' + escapeText(system.systemUptime) + '</div></div><div><span class="label">브리지 가동 시간</span><div>' + escapeText(system.bridgeUptime) + '</div></div></div>';
     }
 
     function renderCommands() {
@@ -984,7 +1371,7 @@ export function renderDashboardHtml(config) {
       button.disabled = true;
       try {
         const command = (document.getElementById("askResearch").checked ? "/lab now " : "/ask ") + request;
-        await runDashboardCommand(command, document.getElementById("askOutput"));
+        await runDashboardCommand(command, document.getElementById("askOutput"), { deliverToTelegram: document.getElementById("askTelegram")?.checked !== false });
         await loadDashboard();
       } finally { button.disabled = false; }
     });
@@ -1027,12 +1414,12 @@ export function renderDashboardHtml(config) {
       }
     });
 
-    async function runDashboardCommand(command, output) {
+    async function runDashboardCommand(command, output, options) {
       output.hidden = false;
       output.textContent = command.replace(/^\\/ask\\s+/, "") + " 실행 중…";
       try {
         const response = await fetch("/api/command", {
-          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command }),
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(Object.assign({ command }, options || {})),
         });
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "명령 실행 실패");
@@ -1041,6 +1428,67 @@ export function renderDashboardHtml(config) {
       } catch (error) { output.textContent = error.message; }
     }
 
+    async function postAction(url, body) {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || "처리하지 못했습니다.");
+      return data;
+    }
+    async function handleScheduleClick(event) {
+      const button = event.target.closest("button[data-schedule-action]");
+      if (button) {
+        const action = button.dataset.scheduleAction;
+        const id = button.closest("[data-schedule-id]").dataset.scheduleId;
+        if (action === "remove" && !window.confirm("이 예약 작업을 삭제할까요?")) return;
+        button.disabled = true;
+        try { await postAction("/api/schedule-action", { id, action }); await loadDashboard(); }
+        catch (error) { window.alert(error.message); }
+        finally { button.disabled = false; }
+        return;
+      }
+      const pauseButton = event.target.closest("button[data-usage-pause]");
+      if (!pauseButton) return;
+      if (!window.confirm("AI 예약 작업 일시 중지를 해제할까요? 한도가 남아 있지 않으면 다시 실패할 수 있습니다.")) return;
+      pauseButton.disabled = true;
+      try { await postAction("/api/usage-pause", { action: "clear" }); await loadDashboard(); }
+      catch (error) { window.alert(error.message); }
+      finally { pauseButton.disabled = false; }
+    }
+    document.getElementById("schedules").addEventListener("click", handleScheduleClick);
+    document.getElementById("statusItems").addEventListener("click", handleScheduleClick);
+    document.getElementById("briefings").addEventListener("click", async event => {
+      const button = event.target.closest("button[data-briefing-action]");
+      if (!button) return;
+      const id = button.closest("[data-briefing-id]").dataset.briefingId;
+      const action = button.dataset.briefingAction;
+      if (action === "resend" && !window.confirm("이 브리핑을 텔레그램으로 다시 보낼까요?")) return;
+      button.disabled = true;
+      try {
+        if (action === "resend") {
+          await postAction("/api/briefing-resend", { id });
+          button.textContent = "보냄";
+        } else {
+          await postAction("/api/briefing-feedback", { id, feedback: action });
+          await loadDashboard();
+        }
+      } catch (error) { window.alert(error.message); }
+      finally { button.disabled = false; }
+    });
+    document.getElementById("repoChecks").addEventListener("click", async event => {
+      const button = event.target.closest("button[data-repo-recheck]");
+      if (!button) return;
+      button.disabled = true;
+      button.textContent = "재점검 중…";
+      try { await postAction("/api/repo-check", { name: button.dataset.repoRecheck }); }
+      catch (error) { window.alert(error.message); button.disabled = false; button.textContent = "재점검"; }
+    });
+    document.addEventListener("click", event => {
+      const button = event.target.closest?.("[data-job-result]");
+      if (!button) return;
+      event.preventDefault();
+      openJobResult(button.dataset.jobResult);
+    });
+
     function formatBytes(bytes) {
       if (!Number.isFinite(bytes)) return "-";
       return (bytes / 1073741824).toFixed(1) + " GB";
@@ -1048,8 +1496,9 @@ export function renderDashboardHtml(config) {
 
     function renderJobs(rows, emptyText) {
       if (!rows.length) return '<div class="empty">' + escapeText(emptyText) + '</div>';
-      return '<table><thead><tr><th style="width:84px">Job</th><th style="width:86px">Kind</th><th style="width:104px">Status</th><th style="width:120px">Engine</th><th>Prompt</th><th style="width:92px">Age</th></tr></thead><tbody>' +
-        rows.map(row => '<tr><td>' + escapeText(row.jobId) + '</td><td>' + escapeText(row.kind) + '</td><td>' + badge(row.status) + '</td><td>' + renderEngine(row) + '</td><td class="prompt">' + escapeText(row.prompt) + '</td><td>' + escapeText(row.age) + '</td></tr>').join("") +
+      const kinds = { chat: "대화", delegate: "위임", scheduled: "예약", "scheduled-local": "로컬 브리핑", emoticon: "이모티콘" };
+      return '<table><thead><tr><th style="width:96px">작업</th><th style="width:86px">종류</th><th style="width:104px">상태</th><th style="width:120px">엔진</th><th>요청</th><th style="width:104px">시각</th></tr></thead><tbody>' +
+        rows.map(row => '<tr><td>' + escapeText(row.jobId) + (row.hasResult ? '<br><button type="button" class="action" data-job-result="' + escapeText(row.jobId) + '">결과 보기</button>' : '') + '</td><td>' + escapeText(kinds[row.kind] || row.kind) + '</td><td>' + badge(row.status) + '</td><td>' + renderEngine(row) + '</td><td class="prompt">' + escapeText(row.prompt) + '</td><td>' + escapeText(formatTime(row.finishedAt || row.startedAt)) + '</td></tr>').join("") +
         '</tbody></table>';
     }
 
@@ -1062,14 +1511,16 @@ export function renderDashboardHtml(config) {
 
     function renderProcesses(rows) {
       if (!rows.length) return '<div class="empty">관리 중인 백그라운드 프로세스가 없습니다.</div>';
-      return '<table><thead><tr><th>Process</th><th>Status</th><th>Command</th></tr></thead><tbody>' +
+      return '<table><thead><tr><th>프로세스</th><th>상태</th><th>명령</th></tr></thead><tbody>' +
         rows.map(row => '<tr><td>' + escapeText(row.processId) + '<br><span class="meta">PID ' + escapeText(row.pid ?? "?") + " | " + escapeText(row.age) + '</span></td><td>' + badge(row.status) + '</td><td class="prompt">' + escapeText(row.command) + '</td></tr>').join("") +
         '</tbody></table>';
     }
 
-    function renderSchedules(rows) {
-      if (!rows.length) return '<div class="empty">No scheduled jobs.</div>';
-      return '<div class="simple-list">' + rows.map(row => '<div class="simple-row"><strong>' + escapeText(scheduleName(row.prompt)) + '</strong><div>' + escapeText(formatTime(row.nextRunAt)) + '</div><div class="meta">' + escapeText(scheduleRepeat(row.repeat)) + (row.failureCount ? ' · 실패 ' + escapeText(row.failureCount) + '회' : '') + '</div></div>').join("") + '</div>';
+    function renderSchedules(rows, withActions) {
+      if (!rows.length) return '<div class="empty">예약 작업이 없습니다.</div>';
+      const actions = '<div class="lab-actions"><button type="button" data-schedule-action="run">지금 실행</button><button type="button" data-schedule-action="skip">한 번 건너뛰기</button><button type="button" data-schedule-action="remove">삭제</button></div>';
+      return '<div class="simple-list">' + rows.map(row => '<div class="simple-row" data-schedule-id="' + escapeText(row.id) + '"><strong>' + escapeText(row.name || scheduleName(row.prompt)) + '</strong><div>' + escapeText(row.nextRunLabel || formatTime(row.nextRunAt)) + '</div><div class="meta">' + escapeText(row.repeatLabel || scheduleRepeat(row.repeat)) + (row.failureCount ? ' · 실패 ' + escapeText(row.failureCount) + '회' : '') + '</div>' +
+        (row.lastError ? '<div class="meta">최근 오류: ' + escapeText(row.lastError) + '</div>' : '') + (withActions ? actions : '') + '</div>').join("") + '</div>';
     }
 
     function scheduleName(prompt) {
@@ -1094,7 +1545,7 @@ export function renderDashboardHtml(config) {
     }
 
     function badge(status) {
-      return '<span class="pill ' + escapeText(status) + '">' + escapeText(status) + '</span>';
+      return '<span class="pill ' + escapeText(status) + '">' + escapeText(statusLabel(status)) + '</span>';
     }
 
     function escapeText(value) {
@@ -1103,17 +1554,36 @@ export function renderDashboardHtml(config) {
 
     let markdownModule = null;
     let viewerReturnFocus = null;
-    async function openDocumentViewer(url, name) {
+    function showViewer(name, downloadUrl) {
       const viewer = document.getElementById("docViewer");
       const body = document.getElementById("docViewerBody");
+      const download = document.getElementById("docViewerDownload");
       viewerReturnFocus = document.activeElement;
       document.getElementById("docViewerTitle").textContent = name;
-      document.getElementById("docViewerDownload").href = url + "&download=1";
+      download.hidden = !downloadUrl;
+      if (downloadUrl) download.href = downloadUrl;
       body.innerHTML = '<div class="empty">불러오는 중…</div>';
       viewer.hidden = false;
       document.body.style.overflow = "hidden";
       if (!history.state?.docViewer) history.pushState({ docViewer: true }, "", location.href);
       document.getElementById("docViewerClose").focus();
+      return body;
+    }
+    async function openJobResult(jobId) {
+      const body = showViewer("작업 결과 · " + jobId, null);
+      try {
+        const response = await fetch("/api/job-result?id=" + encodeURIComponent(jobId), { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "작업 결과를 찾을 수 없습니다.");
+        markdownModule ??= await import("/assets/markdown-render.js");
+        body.innerHTML = '<p class="meta">' + escapeText(statusLabel(data.job.status) + " · " + formatTime(data.job.finishedAt) + " · " + data.job.prompt) + '</p>' + markdownModule.renderMarkdown(data.job.summary);
+        body.scrollTop = 0;
+      } catch (error) {
+        body.innerHTML = '<div class="empty">' + escapeText(error.message) + '</div>';
+      }
+    }
+    async function openDocumentViewer(url, name) {
+      const body = showViewer(name, url + "&download=1");
       try {
         const response = await fetch(url, { cache: "no-store" });
         if (!response.ok) throw new Error("문서를 찾을 수 없습니다.");
@@ -1151,6 +1621,7 @@ export function renderDashboardHtml(config) {
     Promise.all([loadDashboard(), loadN8n(), loadTrading(), loadPortfolio()]).catch(error => {
       document.getElementById("services").innerHTML = '<div class="empty">' + escapeText(error.message) + '</div>';
     });
+${EMOTICON_CLIENT_JS}
     setInterval(loadDashboard, 5000);
     setInterval(loadN8n, 30000);
     setInterval(loadTrading, 30000);

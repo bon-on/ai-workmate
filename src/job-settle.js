@@ -3,17 +3,18 @@ import { ensureLabReport } from "./documents.js";
 import { buildAiUsageReport, formatAiUsageReport } from "./ai-usage-report.js";
 import { repoCheckBriefingLines } from "./repo-checks.js";
 import { getBriefingKind, validateBriefingOutput, normalizeBriefingFormatting, extractTrendTopics } from "./briefing-quality.js";
+import { scheduleName } from "./schedule-names.js";
+import { isUsageLimitError } from "./schedule-store.js";
+import { resolveUsageReset, describePauseEnd } from "./usage-pause.js";
 
 // Job settlement logic extracted from index.js so it can be tested without
 // starting the bridge. Behaviour is unchanged.
-export function createJobSettler({ config, telegram, jobs, workspaces, schedules, personalOps, sessions }) {
+export function createJobSettler({ config, telegram, jobs, workspaces, schedules, personalOps, sessions, readCodexLimits = null }) {
   async function settleJob(job) {
     if (job.status === "completed" && getBriefingKind(job.prompt)) {
       job.summary = normalizeBriefingFormatting(job.summary);
     }
-    if (job.status === "failed") {
-      await schedules.pauseForUsageLimit(`${job.summary}\n${job.lastOutputSnippet || ""}`);
-    }
+    if (job.status === "failed") await pauseOnUsageLimit(job);
     const retry = await retryInvalidBriefing(job);
     if (retry) {
       // The rejected draft still spent tokens; record it so usage reports see the retry.
@@ -37,7 +38,10 @@ export function createJobSettler({ config, telegram, jobs, workspaces, schedules
       try { await personalOps.recordExperimentResult({ chatId: job.chatId, id: labId, job: labJob }); }
       catch (error) { console.error("AI lab result persistence failed:", error.message); }
     }
-    const messageId = await notifyJobResult(telegram, job, { personalOps });
+    // Dashboard requests may opt out of Telegram delivery; metrics and schedule results still apply.
+    // A scheduled run stopped by a usage limit is reported by the pause notice alone (O11).
+    const quiet = job.deliverToTelegram === false || (job.usageLimited && job.scheduleId);
+    const messageId = quiet ? null : await notifyJobResult(telegram, job, { personalOps });
     if (messageId && job.status === "completed" && getBriefingKind(job.prompt) === "aiTrend") {
       try { await personalOps.recordTrendTopics({ chatId: job.chatId, topics: extractTrendTopics(job.summary) }); }
       catch (error) { console.error("AI trend topic persistence failed:", error.message); }
@@ -58,6 +62,26 @@ export function createJobSettler({ config, telegram, jobs, workspaces, schedules
       createdAt: job.finishedAt,
       provider: job.provider,
     });
+  }
+
+  // One notice per new pause; extending an active pause stays quiet.
+  async function pauseOnUsageLimit(job) {
+    const text = `${job.summary}\n${job.lastOutputSnippet || ""}`;
+    if (!isUsageLimitError(text)) return;
+    // Not the schedule's fault: the pause notice below is the only message (O11).
+    job.usageLimited = true;
+    const wasPaused = schedules.isUsagePaused?.() ?? false;
+    const reset = wasPaused ? {} : await resolveUsageReset(job, { readCodexLimits });
+    const applied = await schedules.pauseForUsageLimit(text, new Date(), {
+      ...reset,
+      chatId: job.chatId,
+      scheduleName: job.scheduleId ? scheduleName(job.prompt) : null,
+    });
+    if (!applied || wasPaused || !job.chatId) return;
+    const pause = schedules.getUsagePause?.();
+    if (!pause) return;
+    try { await telegram.sendMessage(job.chatId, formatUsagePauseNotice(pause)); }
+    catch (error) { console.error("Usage pause notice failed:", error.message); }
   }
 
   async function retryInvalidBriefing(job) {
@@ -112,6 +136,7 @@ export function createJobSettler({ config, telegram, jobs, workspaces, schedules
       await schedules.recordSuccess(job.scheduleId);
       return;
     }
+    if (job.usageLimited) return;
 
     const updated = await schedules.recordFailure(job.scheduleId, job.summary, {
       maxFailures: config.scheduleMaxFailures,
@@ -119,10 +144,21 @@ export function createJobSettler({ config, telegram, jobs, workspaces, schedules
     if (updated?.disabled) {
       await telegram.sendMessage(
         job.chatId,
-        `Schedule ${job.scheduleId} was disabled after ${updated.failureCount} failure(s).`,
+        `⛔ 예약 작업 '${scheduleName(updated.prompt)}'(${job.scheduleId})을 ${updated.failureCount}회 연속 실패로 중지했습니다.`,
       );
     }
   }
 
   return { settleJob, retryInvalidBriefing, recordScheduledJobResult };
+}
+
+export function formatUsagePauseNotice(pause) {
+  return [
+    "⏸ AI 예약 작업을 잠시 멈췄습니다",
+    `사유: ${pause.reason}`,
+    ...(pause.scheduleName ? [`영향: ${pause.scheduleName}`] : []),
+    describePauseEnd(pause),
+    "모닝·이브닝 브리핑과 영어 학습은 계속 발송됩니다.",
+    "지금 다시 시작하려면 /resume",
+  ].join("\n");
 }

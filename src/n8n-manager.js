@@ -6,9 +6,28 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 export class N8nManager {
-  constructor({ port = 5678, databasePath } = {}) {
+  constructor({ port = 5678, databasePath, fetchImpl, readApiKey } = {}) {
     this.baseUrl = `http://127.0.0.1:${port}/api/v1`;
     this.databasePath = databasePath || path.join(os.homedir(), ".n8n", "database.sqlite");
+    this.fetchImpl = fetchImpl || ((...args) => fetch(...args));
+    this.readApiKeyImpl = readApiKey || null;
+  }
+
+  // Failed executions of active workflows since `since`, grouped by workflow name.
+  async recentFailures({ since, limit = 100 } = {}) {
+    const [workflowResponse, failureResponse] = await Promise.all([
+      this.#request("/workflows?limit=100"),
+      this.#request(`/executions?status=error&limit=${limit}&includeData=false`),
+    ]);
+    const active = new Map((workflowResponse.data ?? []).filter((row) => row.active && !row.isArchived).map((row) => [row.id, row.name]));
+    const sinceMs = since ? new Date(since).getTime() : 0;
+    const counts = new Map();
+    for (const row of failureResponse.data ?? []) {
+      if (!active.has(row.workflowId) || !(Date.parse(row.startedAt) >= sinceMs)) continue;
+      const name = active.get(row.workflowId);
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+    return [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
   }
 
   async overview() {
@@ -81,8 +100,8 @@ export class N8nManager {
   }
 
   async #request(resource, options = {}) {
-    const apiKey = await this.#readApiKey();
-    const response = await fetch(this.baseUrl + resource, {
+    const apiKey = this.readApiKeyImpl ? await this.readApiKeyImpl() : await this.#readApiKey();
+    const response = await this.fetchImpl(this.baseUrl + resource, {
       ...options,
       headers: { "X-N8N-API-KEY": apiKey, "content-type": "application/json", ...options.headers },
       signal: AbortSignal.timeout(5000),

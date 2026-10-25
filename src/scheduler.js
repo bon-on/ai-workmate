@@ -1,5 +1,7 @@
 import { getBriefingKind } from "./briefing-quality.js";
 import { ENGLISH_STUDY_MARKER } from "./english-study.js";
+import { applyLatePrefix } from "./local-briefing.js";
+import { scheduleName } from "./schedule-names.js";
 
 const BUSY_RETRY_MS = 60 * 1000;
 const runningTicks = new WeakSet();
@@ -58,7 +60,7 @@ export async function runDueSchedules({
       await schedules.delay(entry.id, BUSY_RETRY_MS, now);
       await telegram.sendMessage(
         entry.chatId,
-        `Scheduled job ${entry.id} could not start because workspace ${entry.workspaceAlias} is unavailable.`,
+        `⚠️ 예약 작업 '${scheduleName(entry.prompt)}'(${entry.id})을 시작하지 못했습니다: 작업 공간 ${entry.workspaceAlias}을 찾을 수 없습니다. 1분 뒤 다시 시도합니다.`,
       );
       continue;
     }
@@ -74,11 +76,17 @@ export async function runDueSchedules({
     // Persist advancement before slow context collection or process startup.
     // A crash may skip this occurrence, but must not repeatedly spend tokens.
     const isBriefing = Boolean(briefingKind);
+    // markStarted mutates the entry, so keep the occurrence time for the late-delivery check.
+    const scheduledAt = entry.nextRunAt;
     if (isBriefing) await schedules.markStarted(entry.id, now);
     if (isLocalBriefing) {
       try {
-        const summary = await runLocalBriefing(entry, briefingKind, now);
-        await onJobSettled(localJob(entry, workspace, briefingKind, now, "completed", summary));
+        const built = await runLocalBriefing(entry, briefingKind, now, { scheduledAt });
+        const late = applyLatePrefix(typeof built === "string" ? built : built?.summary, scheduledAt, now);
+        const job = localJob(entry, workspace, briefingKind, now, "completed", late.text);
+        if (late.late) job.late = true;
+        if (built?.replyMarkup) job.replyMarkup = built.replyMarkup;
+        await onJobSettled(job);
       } catch (error) {
         await onJobSettled(localJob(entry, workspace, briefingKind, now, "failed", `로컬 브리핑 생성 실패: ${error.message}`));
       }
@@ -107,7 +115,7 @@ export async function runDueSchedules({
     started.job.completion
       .then((job) => onJobSettled(job))
       .catch(async (error) => {
-        await telegram.sendMessage(entry.chatId, `Scheduled job failed unexpectedly: ${error.message}`);
+        await telegram.sendMessage(entry.chatId, `⚠️ 예약 작업 '${scheduleName(entry.prompt)}' 처리 중 오류가 발생했습니다: ${error.message}`);
       });
   }
 

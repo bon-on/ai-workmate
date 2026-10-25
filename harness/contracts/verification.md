@@ -8,8 +8,10 @@ related_specs:
   - claude-primary
   - repo-checks
   - ops-approval
+  - daily-ux
   - ai-usage-report
   - english-study
+  - emoticon-studio
 evidence_files:
   - out/evidence/harness-latest/checks.json
 ---

@@ -44,3 +44,15 @@ test("TelegramClient reports Telegram API descriptions", async () => {
 
   await assert.rejects(() => client.getMe(), /Bad Gateway/);
 });
+
+test("TelegramClient.setMyCommands posts the command list", async () => {
+  const client = new TelegramClient("token", {
+    fetchImpl: async (url, options) => {
+      assert.match(url, /setMyCommands$/);
+      assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), { commands: [{ command: "help", description: "도움말" }] });
+      return { ok: true, async json() { return { ok: true, result: true }; } };
+    },
+  });
+  assert.equal(await client.setMyCommands([{ command: "help", description: "도움말" }]), true);
+});

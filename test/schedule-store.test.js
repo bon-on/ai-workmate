@@ -52,10 +52,11 @@ test("usage limit pauses all scheduled work across restart until reset", async (
   assert.equal(reloaded.isUsagePaused(new Date(until)), false);
 });
 
-test("unknown usage reset uses conservative 24-hour cooldown", async (t) => {
+test("unknown usage reset uses a 6-hour cooldown and stores its reason", async (t) => {
   const { store, now } = await briefingStore(t);
   await store.pauseForUsageLimit("usage_limit_reached", now);
-  assert.equal(Date.parse(store.usagePausedUntil) - now.getTime(), 86400000);
+  assert.equal(Date.parse(store.usagePausedUntil) - now.getTime(), 6 * 3600000);
+  assert.match(store.getUsagePause(now).reason, /재설정 시각 불명/);
 });
 
 test("parseScheduleRequest parses one-time and recurring schedules", () => {

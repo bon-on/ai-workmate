@@ -44,7 +44,9 @@ export class PersonalOpsStore {
     }
   }
 
-  async addInbox({ chatId, type = "idea", text, source = "telegram", now = new Date() }) {
+  async addInbox({ chatId, type = "idea", text, source = "telegram", dueAt = null, now = new Date() }) {
+    const due = dueAt ? new Date(dueAt) : null;
+    if (due && Number.isNaN(due.getTime())) throw new Error("Invalid inbox due date.");
     const normalizedType = INBOX_TYPES.has(type) ? type : "idea";
     const entry = {
       id: `in-${randomUUID().slice(0, 6)}`,
@@ -54,6 +56,7 @@ export class PersonalOpsStore {
       source,
       status: "open",
       snoozedUntil: null,
+      dueAt: due ? due.toISOString() : null,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -259,6 +262,9 @@ export class PersonalOpsStore {
       outputTokens: Number(job.usage?.outputTokens || 0),
       qualityRejected,
       briefingRetry: Number(job.briefingRetryCount || 0) > 0,
+      late: job.late === true,
+      scheduleId: job.scheduleId || null,
+      error: job.status === "completed" ? null : firstLine(job.summary),
       startedAt: job.startedAt,
       finishedAt: job.finishedAt || new Date().toISOString(),
     };
@@ -267,6 +273,18 @@ export class PersonalOpsStore {
     for (const row of rows.slice(1000)) this.runMetrics.delete(row.id);
     await this.#save();
     return entry;
+  }
+
+  // Failed or late runs in the window, newest first, so reports see past failures
+  // even after a later success reset the schedule's failure streak.
+  listRunIssues(chatId, { days = 7, now = new Date() } = {}) {
+    const cutoff = now.getTime() - days * 24 * 60 * 60 * 1000;
+    return [...this.runMetrics.values()]
+      .filter((row) => row.chatId === String(chatId) && Date.parse(row.finishedAt) >= cutoff)
+      .filter((row) => row.status !== "completed" || row.late)
+      .sort((a, b) => Date.parse(b.finishedAt) - Date.parse(a.finishedAt))
+      .slice(0, 20)
+      .map((row) => ({ at: row.finishedAt, title: row.title, status: row.status, late: Boolean(row.late), error: row.error ?? null }));
   }
 
   // Finished runs survive bridge restarts, unlike the in-memory job list.
@@ -331,6 +349,8 @@ export class PersonalOpsStore {
     const existing = this.alerts.get(key);
     if (existing && now.getTime() - Date.parse(existing.sentAt) < cooldownMs) return false;
     this.alerts.set(key, { key, sentAt: now.toISOString() });
+    // State-keyed alerts (e.g. schedule failures) accumulate; drop ones untouched for 30 days.
+    for (const [oldKey, row] of this.alerts) if (now.getTime() - Date.parse(row.sentAt) > 30 * 24 * 60 * 60 * 1000) this.alerts.delete(oldKey);
     await this.#save();
     return true;
   }
@@ -358,7 +378,7 @@ export class PersonalOpsStore {
     };
   }
 
-  async recordBriefing({ chatId, kind, text, recommendations = [], now = new Date() }) {
+  async recordBriefing({ chatId, kind, text, recommendations = [], late = false, now = new Date() }) {
     const entry = {
       id: `br-${randomUUID().slice(0, 8)}`,
       chatId: String(chatId),
@@ -367,6 +387,7 @@ export class PersonalOpsStore {
       recommendations: recommendations.map((item) => String(item).slice(0, 500)).slice(0, 6),
       feedback: null,
       recommendationFeedback: {},
+      late: Boolean(late),
       sentAt: now.toISOString(),
     };
     this.briefings.set(entry.id, entry);
@@ -453,6 +474,7 @@ function compactInbox(row) {
     type: row.type,
     text: row.text,
     status: row.status,
+    dueAt: row.dueAt || null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -499,4 +521,9 @@ function validExperiment(row) {
 function runTitle(prompt) {
   const lines = String(prompt || "").split("\n").map((line) => line.replace(/^\[AI_WORKMATE_[A-Z_]+(?::[\w-]+)?\]\s*/, "").trim()).filter(Boolean);
   return (lines[0] || "").slice(0, 120) || null;
+}
+
+function firstLine(text) {
+  const line = String(text || "").split(/\r?\n/).map((row) => row.trim()).find(Boolean);
+  return line ? line.slice(0, 120) : null;
 }

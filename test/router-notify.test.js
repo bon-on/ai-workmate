@@ -69,7 +69,7 @@ test("notifyJobResult skips non-image artifacts such as codex.log", async () => 
     [
       "message",
       "1",
-      "Codex job completed.\nJob: abc123\nSession: sess-1\nMode: new\nWorkspace: default\n\ndone",
+      "done\n\n✅ Codex · /job abc123",
       {},
     ],
     ["photo", "1", "/tmp/lion.png", "Generated file: lion.png"],

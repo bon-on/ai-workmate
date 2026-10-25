@@ -11,10 +11,8 @@ test("buildCompletionMessage uses cancelled status header", () => {
     summary: "Cancelled by Telegram command.",
   });
 
-  assert.match(message, /Codex job cancelled\./);
-  assert.match(message, /Job: abc123/);
-  assert.match(message, /Session: sess-1/);
-  assert.match(message, /Mode: new/);
+  assert.equal(message, "Cancelled by Telegram command.\n\n⏹ 취소됨 · Codex · /job abc123");
+  assert.doesNotMatch(message, /Job:|Session:|Mode:|Workspace:/);
 });
 
 test("buildCompletionMessage omits job metadata for completed personal briefings", () => {

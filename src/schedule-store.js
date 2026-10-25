@@ -3,6 +3,14 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getBriefingKind } from "./briefing-quality.js";
 
+const UNKNOWN_RESET_PAUSE_MS = 6 * 60 * 60 * 1000;
+const USAGE_LIMIT_PATTERN = /usage_limit_reached|hit your usage limit|usage limit (?:has been )?(?:reached|exceeded)/i;
+const EARLY_RELEASE_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+
+export function isUsageLimitError(text) {
+  return USAGE_LIMIT_PATTERN.test(String(text || ""));
+}
+
 export class ScheduleStore {
   constructor(statePath) {
     this.statePath = statePath;
@@ -10,6 +18,9 @@ export class ScheduleStore {
     this.entries = new Map();
     this.briefingAttempts = {};
     this.usagePausedUntil = null;
+    this.usagePauseReason = null;
+    this.usagePauseMeta = null;
+    this.lastEarlyReleaseAt = null;
     this.saveQueue = Promise.resolve();
   }
 
@@ -24,6 +35,9 @@ export class ScheduleStore {
       this.entries.clear();
       this.briefingAttempts = parsed.briefingAttempts || {};
       this.usagePausedUntil = parsed.usagePausedUntil || null;
+      this.usagePauseReason = typeof parsed.usagePauseReason === "string" ? parsed.usagePauseReason : null;
+      this.usagePauseMeta = parsed.usagePauseMeta && typeof parsed.usagePauseMeta === "object" ? parsed.usagePauseMeta : null;
+      this.lastEarlyReleaseAt = parsed.lastEarlyReleaseAt || null;
       for (const entry of parsed.entries) {
         if (!isValidEntry(entry)) {
           continue;
@@ -88,16 +102,63 @@ export class ScheduleStore {
     return Date.parse(this.usagePausedUntil) > now.getTime();
   }
 
-  async pauseForUsageLimit(error, now = new Date()) {
+  getUsagePause(now = new Date()) {
+    if (!this.isUsagePaused(now)) return null;
+    return this.peekUsagePause();
+  }
+
+  async clearUsagePause({ early = false, now = new Date() } = {}) {
+    this.usagePausedUntil = null;
+    this.usagePauseReason = null;
+    this.usagePauseMeta = null;
+    if (early) this.lastEarlyReleaseAt = now.toISOString();
+    await this.#save();
+  }
+
+  // A pause that was set and has not been lifted yet, even after its end time,
+  // so the schedule tick can announce the resume exactly once.
+  peekUsagePause() {
+    if (!this.usagePausedUntil) return null;
+    return { until: this.usagePausedUntil, reason: this.usagePauseReason || "AI 사용 한도 도달", ...(this.usagePauseMeta || {}) };
+  }
+
+  // Moves the end of an active pause to a newly read reset time.
+  async extendUsagePause(resetAt) {
+    const until = Date.parse(resetAt) + 60_000;
+    if (!this.usagePausedUntil || !Number.isFinite(until) || until <= Date.parse(this.usagePausedUntil)) return false;
+    this.usagePausedUntil = new Date(until).toISOString();
+    await this.#save();
+    return true;
+  }
+
+  // Returns true only when a usage-limit error set or extended the pause.
+  // `resetAt` is the provider's reset time when known (O10); `canReleaseEarly`
+  // says whether a later limit read may be trusted to end the pause.
+  async pauseForUsageLimit(error, now = new Date(), { resetAt = null, provider = null, chatId = null, scheduleName = null, canReleaseEarly = false } = {}) {
     const text = String(error || "");
-    if (!/usage_limit_reached|hit your usage limit|usage limit (?:has been )?(?:reached|exceeded)/i.test(text)) return false;
+    if (!USAGE_LIMIT_PATTERN.test(text)) return false;
     const retryAt = text.match(/try again at ([A-Za-z]{3,9} \d{1,2}(?:st|nd|rd|th)?, \d{4} \d{1,2}:\d{2}\s*[AP]M)/i)?.[1];
-    const parsed = retryAt ? Date.parse(retryAt.replace(/(\d)(st|nd|rd|th)/g, "$1")) : NaN;
+    const fromText = retryAt ? Date.parse(retryAt.replace(/(\d)(st|nd|rd|th)/g, "$1")) : NaN;
+    const fromProvider = Date.parse(resetAt);
     // CLI reset timestamps use the host timezone. Unknown resets fail closed
-    // for 24 hours instead of spending another attempt every few minutes.
-    const until = Number.isFinite(parsed) && parsed > now.getTime()
-      ? parsed + 60_000 : now.getTime() + 24 * 60 * 60 * 1000;
-    this.usagePausedUntil = new Date(Math.max(until, Date.parse(this.usagePausedUntil) || 0)).toISOString();
+    // for 6 hours instead of spending another attempt every few minutes.
+    const parsed = Number.isFinite(fromProvider) && fromProvider > now.getTime() ? fromProvider : fromText;
+    const known = Number.isFinite(parsed) && parsed > now.getTime();
+    const until = known ? parsed + 60_000 : now.getTime() + UNKNOWN_RESET_PAUSE_MS;
+    const wasPaused = this.isUsagePaused(now);
+    // An unknown reset never stretches an active pause; only a known reset may extend it.
+    if (!wasPaused || known) this.usagePausedUntil = new Date(Math.max(until, wasPaused ? Date.parse(this.usagePausedUntil) : 0)).toISOString();
+    if (!wasPaused || !this.usagePauseReason) {
+      const line = text.split(/\r?\n/).find((row) => USAGE_LIMIT_PATTERN.test(row))?.trim() || "";
+      this.usagePauseReason = `AI 사용 한도 도달${known ? "" : " (재설정 시각 불명, 6시간 대기)"}${line ? ` · ${line.slice(0, 100)}` : ""}`;
+      const recentlyReleased = now.getTime() - Date.parse(this.lastEarlyReleaseAt || 0) < EARLY_RELEASE_COOLDOWN_MS;
+      this.usagePauseMeta = {
+        provider,
+        chatId: chatId == null ? null : String(chatId),
+        scheduleName,
+        canReleaseEarly: Boolean(canReleaseEarly) && !recentlyReleased,
+      };
+    }
     await this.#save();
     return true;
   }
@@ -109,8 +170,15 @@ export class ScheduleStore {
     const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(now);
     const key = `${day}:${entry.chatId}:${kind}`;
     const attempts = this.briefingAttempts[key] || 0;
-    if ((!retry && attempts > 0) || (retry && attempts !== 1)) return false;
-    this.briefingAttempts[key] = attempts + 1;
+    if (entry.manualRun && !retry) {
+      // Run-now after today's attempt: allow exactly one more per day so spending stays capped.
+      const manualKey = `${key}:manual`;
+      if (this.briefingAttempts[manualKey]) return false;
+      this.briefingAttempts[manualKey] = 1;
+    } else {
+      if ((!retry && attempts > 0) || (retry && attempts !== 1)) return false;
+      this.briefingAttempts[key] = attempts + 1;
+    }
     // Retain a small restart-safe ledger, independent of schedule IDs.
     for (const old of Object.keys(this.briefingAttempts)) {
       if (old.slice(0, 10) < new Date(now.getTime() - 8 * 86400000).toISOString().slice(0, 10)) delete this.briefingAttempts[old];
@@ -146,6 +214,37 @@ export class ScheduleStore {
     return entry;
   }
 
+  // Makes an entry due now; a recurring entry returns to its regular occurrence afterwards.
+  async runNow(id, { chatId, now = new Date() } = {}) {
+    const entry = this.entries.get(id);
+    if (!entry || entry.chatId !== String(chatId)) return null;
+    if (entry.intervalMs && Date.parse(entry.nextRunAt) > now.getTime()) entry.resumeAt = entry.resumeAt || entry.nextRunAt;
+    entry.nextRunAt = now.toISOString();
+    // A manual run may spend one extra briefing attempt per day (see reserveBriefingAttempt).
+    entry.manualRun = true;
+    await this.#save();
+    return entry;
+  }
+
+  // Skips one occurrence. A one-time entry is removed (returned with removed: true).
+  async skipNext(id, { chatId, now = new Date() } = {}) {
+    const entry = this.entries.get(id);
+    if (!entry || entry.chatId !== String(chatId)) return null;
+    if (!entry.intervalMs) {
+      this.entries.delete(id);
+      await this.#save();
+      return { ...entry, removed: true };
+    }
+    let next = new Date(entry.resumeAt || entry.nextRunAt);
+    delete entry.resumeAt;
+    delete entry.manualRun;
+    // An overdue occurrence counts as the next one; skip past it and anything before now.
+    do next = advanceOccurrence(entry, next); while (next <= now);
+    entry.nextRunAt = next.toISOString();
+    await this.#save();
+    return entry;
+  }
+
   async markStarted(id, now = new Date()) {
     const entry = this.entries.get(id);
     if (!entry) {
@@ -158,7 +257,12 @@ export class ScheduleStore {
       return null;
     }
 
-    entry.nextRunAt = computeNextRunAt(entry, now).toISOString();
+    const resumeAt = entry.resumeAt;
+    delete entry.resumeAt;
+    delete entry.manualRun;
+    entry.nextRunAt = resumeAt && Date.parse(resumeAt) > now.getTime()
+      ? resumeAt
+      : computeNextRunAt(resumeAt ? { ...entry, nextRunAt: resumeAt } : entry, now).toISOString();
     await this.#save();
     return entry;
   }
@@ -171,6 +275,7 @@ export class ScheduleStore {
 
     entry.failureCount = 0;
     entry.lastError = null;
+    delete entry.failingSince;
     await this.#save();
     return entry;
   }
@@ -182,6 +287,8 @@ export class ScheduleStore {
     }
 
     entry.failureCount = (entry.failureCount ?? 0) + 1;
+    // Marks the failure episode so its alert is sent once (O2).
+    if (entry.failureCount === 1 || !entry.failingSince) entry.failingSince = new Date().toISOString();
     entry.lastError = String(error || "Scheduled job failed").slice(0, 500);
     if (getBriefingKind(entry.prompt)) {
       // Its next normal occurrence was already persisted before execution.
@@ -217,6 +324,9 @@ export class ScheduleStore {
       entries: this.list(),
       briefingAttempts: this.briefingAttempts,
       usagePausedUntil: this.usagePausedUntil,
+      usagePauseReason: this.usagePauseReason,
+      usagePauseMeta: this.usagePauseMeta,
+      lastEarlyReleaseAt: this.lastEarlyReleaseAt,
     };
     const serialized = `${JSON.stringify(payload, null, 2)}\n`;
     const write = this.saveQueue.then(async () => {
@@ -401,6 +511,13 @@ function computeNextRunAt(entry, now) {
   return new Date(now.getTime() + entry.intervalMs);
 }
 
+function advanceOccurrence(entry, from) {
+  if (entry.intervalMs === 24 * 60 * 60 * 1000) {
+    return nextDailyRun(from, from.getHours(), from.getMinutes(), entry.weekdaysOnly);
+  }
+  return new Date(from.getTime() + entry.intervalMs);
+}
+
 function nextDailyRun(now, hour, minute, weekdaysOnly) {
   const next = new Date(now);
   next.setHours(hour, minute, 0, 0);
@@ -450,6 +567,12 @@ function normalizeEntry(entry) {
     failureCount: Number.isInteger(entry.failureCount) ? entry.failureCount : 0,
     lastError: typeof entry.lastError === "string" ? entry.lastError : null,
     createdAt: entry.createdAt,
+    ...(typeof entry.resumeAt === "string" && !Number.isNaN(Date.parse(entry.resumeAt)) ? { resumeAt: entry.resumeAt } : {}),
+    ...(entry.manualRun === true ? { manualRun: true } : {}),
+    // Entries failing before episodes existed get a stable start so their alert key never changes.
+    ...(typeof entry.failingSince === "string" && !Number.isNaN(Date.parse(entry.failingSince))
+      ? { failingSince: entry.failingSince }
+      : entry.failureCount > 0 ? { failingSince: String(entry.createdAt || "legacy") } : {}),
   };
 }
 

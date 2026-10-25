@@ -84,6 +84,15 @@ export class TelegramClient {
     });
   }
 
+  // Registers the command menu shown by Telegram clients. Names: 1-32 chars of [a-z0-9_].
+  async setMyCommands(commands) {
+    return this.#request("setMyCommands", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commands }),
+    });
+  }
+
   async deleteWebhook({ dropPendingUpdates = false } = {}) {
     return this.#request("deleteWebhook", {
       method: "POST",

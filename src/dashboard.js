@@ -1,6 +1,10 @@
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { evaluateBriefingHistory } from "./briefing-eval.js";
+import * as briefingQualityModule from "./briefing-quality.js";
+import { formatKst, scheduleName, scheduleRepeatLabel } from "./schedule-names.js";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function buildDashboardSnapshot({
   chatId,
@@ -9,6 +13,7 @@ export function buildDashboardSnapshot({
   schedules,
   workspaces,
   personalOps,
+  jobResults = null,
   now = new Date(),
   uptimeSeconds = process.uptime(),
 }) {
@@ -24,8 +29,16 @@ export function buildDashboardSnapshot({
   const personal = personalOps?.summary?.(chatId) ?? { openInbox: 0, inboxByType: {}, watches: 0, watchFailures: 0 };
   const usage = personalOps?.usageSummary?.(chatId, { days: 30, now }) ?? summarizeUsage(recentJobs);
   const briefingQuality = evaluateBriefingHistory(personalOps?.listBriefingHistory?.(chatId, { days: 30, limit: 40, now }) ?? []);
-  const recentBriefings = (personalOps?.listBriefingHistory?.(chatId, { days: 14, limit: 8, now }) ?? []).map((row) => ({ id: row.id, kind: row.kind, sentAt: row.sentAt, text: row.text }));
-  const inbox = (personalOps?.listInbox?.(chatId, { now }) ?? []).slice(0, 8).map((row) => ({ id: row.id, type: row.type, text: row.text, createdAt: row.createdAt }));
+  const briefingHealth = summarizeBriefingHealthSafe(personalOps, chatId, now);
+  const recentBriefings = (personalOps?.listBriefingHistory?.(chatId, { days: 14, limit: 8, now }) ?? []).map((row) => ({ id: row.id, kind: row.kind, sentAt: row.sentAt, text: row.text, feedback: row.feedback ?? null }));
+  const inbox = (personalOps?.listInbox?.(chatId, { now }) ?? []).slice(0, 8).map((row) => summarizeInboxRow(row, now));
+  const usagePause = readUsagePause(schedules, now);
+  const failingSchedules = scheduledJobs.filter((entry) => entry.lastError || entry.failureCount > 0).slice(0, 5).map((entry) => ({
+    id: entry.id,
+    name: scheduleName(entry.prompt),
+    failureCount: entry.failureCount ?? 0,
+    lastError: summarize(entry.lastError || "실패 원인이 기록되지 않았습니다.", 160),
+  }));
   const preferences = (personalOps?.listPreferences?.(chatId) ?? []).slice(0, 20);
   const experiments = (personalOps?.listExperiments?.(chatId, { includeArchived: true }) ?? []).map((row) => ({
     id: row.id,
@@ -63,18 +76,21 @@ export function buildDashboardSnapshot({
       },
       schedules: {
         active: scheduledJobs.length,
-        usagePaused: schedules?.isUsagePaused?.(now) ?? false,
-        usagePausedUntil: schedules?.usagePausedUntil ?? null,
+        usagePaused: Boolean(usagePause),
+        usagePausedUntil: usagePause?.until ?? null,
       },
     },
+    usagePause,
+    failingSchedules,
     activeJob: activeJob ? summarizeJob(activeJob, now) : null,
     runningDelegates: runningDelegates.slice(0, 5).map((job) => summarizeJob(job, now)),
-    recentJobs: mergeRecentJobs(recentJobs, personalOps?.listRecentRuns?.(chatId, { limit: 8 }) ?? [], now),
+    recentJobs: mergeRecentJobs(recentJobs, personalOps?.listRecentRuns?.(chatId, { limit: 8 }) ?? [], now, jobResults),
     processes: managedProcesses.slice(0, 8).map((entry) => summarizeProcess(entry, now)),
     schedules: scheduledJobs.slice(0, 20).map(summarizeSchedule),
     personal,
     usage,
     briefingQuality,
+    briefingHealth,
     recentBriefings,
     inbox,
     preferences,
@@ -198,10 +214,55 @@ function buildDelegatePool(config, runningDelegates) {
   };
 }
 
-function mergeRecentJobs(liveJobs, runs, now) {
+// Optional until briefing-quality.js ships summarizeBriefingHealth; a failure must not break the dashboard.
+function summarizeBriefingHealthSafe(personalOps, chatId, now) {
+  const summarizeBriefingHealth = briefingQualityModule.summarizeBriefingHealth;
+  if (typeof summarizeBriefingHealth !== "function" || !personalOps) return null;
+  try {
+    return summarizeBriefingHealth({ personalOps, chatId, now }) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readUsagePause(schedules, now) {
+  let pause = null;
+  if (typeof schedules?.getUsagePause === "function") {
+    pause = schedules.getUsagePause(now);
+  } else if (schedules?.isUsagePaused?.(now)) {
+    pause = { until: schedules.usagePausedUntil ?? null, reason: null };
+  }
+  if (!pause?.until) return null;
+  return { until: pause.until, untilLabel: formatKst(pause.until), reason: pause.reason ?? null };
+}
+
+function summarizeInboxRow(row, now) {
+  const created = Date.parse(row.createdAt);
+  const due = Date.parse(row.dueAt);
+  return {
+    id: row.id,
+    type: row.type,
+    text: row.text,
+    createdAt: row.createdAt,
+    dueAt: row.dueAt ?? null,
+    dueLabel: Number.isFinite(due) ? formatKstDate(due) : null,
+    overdue: Number.isFinite(due) && due < now.getTime(),
+    daysWaiting: Number.isFinite(created) ? Math.max(0, Math.floor((now.getTime() - created) / DAY_MS)) : null,
+  };
+}
+
+function formatKstDate(timestamp) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Seoul", month: "numeric", day: "numeric" }).formatToParts(new Date(timestamp));
+  const part = (type) => parts.find((row) => row.type === type)?.value;
+  return `${part("month")}/${part("day")}`;
+}
+
+function mergeRecentJobs(liveJobs, runs, now, jobResults = null) {
   const live = liveJobs.slice(0, 8).map((job) => summarizeJob(job, now));
   const seen = new Set(live.map((job) => job.jobId));
-  const persisted = runs.filter((run) => !seen.has(run.id)).map((run) => ({
+  const persisted = runs.filter((run) => !seen.has(run.id)).map((run) => {
+    const stored = jobResults?.get?.(run.id) ?? null;
+    return {
     jobId: run.id,
     kind: run.kind,
     status: run.status,
@@ -213,10 +274,13 @@ function mergeRecentJobs(liveJobs, runs, now) {
     model: run.model ?? null,
     fallbackReason: run.fallbackReason ?? null,
     prompt: summarize(run.title || (run.kind === "scheduled-local" ? "로컬 브리핑" : "(기록 이전 작업)")),
-    summary: "",
+    summary: stored?.summary ? summarize(stored.summary, 500) : "",
+    summaryTruncated: stored?.summary ? compactLength(stored.summary) > 500 : false,
+    hasResult: Boolean(stored?.summary),
     usage: null,
     persisted: true,
-  }));
+    };
+  });
   return [...live, ...persisted]
     .sort((a, b) => Date.parse(b.finishedAt || b.startedAt || 0) - Date.parse(a.finishedAt || a.startedAt || 0))
     .slice(0, 8);
@@ -237,8 +301,14 @@ function summarizeJob(job, now) {
     fallbackReason: job.provider === "codex" ? job.fallbackReason ?? null : null,
     prompt: summarize(job.prompt),
     summary: summarize(job.summary, 500),
+    summaryTruncated: compactLength(job.summary) > 500,
+    hasResult: !isLiveStatus(job.status) && Boolean(job.summary),
     usage: job.usage ?? null,
   };
+}
+
+function compactLength(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().length;
 }
 
 function summarizeUsage(jobs) {
@@ -271,7 +341,12 @@ function summarizeSchedule(entry) {
     id: entry.id,
     workspaceAlias: entry.workspaceAlias,
     nextRunAt: entry.nextRunAt,
+    nextRunLabel: formatKst(entry.nextRunAt),
     repeat,
+    name: scheduleName(entry.prompt),
+    repeatLabel: scheduleRepeatLabel(entry),
+    weekdaysOnly: Boolean(entry.weekdaysOnly),
+    lastError: entry.lastError ? summarize(entry.lastError, 160) : null,
     failureCount: entry.failureCount ?? 0,
     prompt: summarize(entry.prompt),
   };

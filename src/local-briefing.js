@@ -1,5 +1,10 @@
 import { buildBriefingContext } from "./briefing-context.js";
 import { repoCheckBriefingLines } from "./repo-checks.js";
+import { formatKstClock } from "./schedule-names.js";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const LATE_AFTER_MS = 10 * 60 * 1000;
+const DUE_SOON_MS = 2 * DAY_MS;
 
 const WEATHER = new Map([
   [0, "맑음"], [1, "대체로 맑음"], [2, "구름 조금"], [3, "흐림"],
@@ -8,6 +13,7 @@ const WEATHER = new Map([
   [80, "소나기"], [81, "소나기"], [82, "강한 소나기"], [95, "뇌우"], [96, "우박 동반 뇌우"], [99, "강한 우박 동반 뇌우"],
 ]);
 
+// Returns { summary, replyMarkup } when the morning focus item gets inline buttons, otherwise a string.
 export async function buildLocalBriefing({ kind, config, chatId, personalOps, schedules, now = new Date(), fetchImpl = fetch }) {
   const snapshot = await buildBriefingContext({
     config, chatId, personalOps, schedules, now,
@@ -15,9 +21,58 @@ export async function buildLocalBriefing({ kind, config, chatId, personalOps, sc
     includeTrading: kind === "evening",
   });
   const recommendations = await generateLocalRecommendations({ kind, snapshot, config, fetchImpl, now });
-  return kind === "morning"
-    ? formatMorning(snapshot, recommendations, now, repoCheckBriefingLines(personalOps?.getRepoChecks?.(), { now }))
-    : formatEvening(snapshot, recommendations, now);
+  if (kind !== "morning") return formatEvening(snapshot, recommendations, now);
+  // The full open list, not the newest-30 context slice, so old items can surface.
+  const focus = pickFocusItem(personalOps?.listInbox?.(chatId, { now }) ?? snapshot.personal?.inbox, now);
+  const summary = formatMorning(snapshot, recommendations, now, repoCheckBriefingLines(personalOps?.getRepoChecks?.(), { now }), { focus });
+  return focus ? { summary, replyMarkup: inboxFocusMarkup(focus.id) } : summary;
+}
+
+// Overdue or due within two days first (earliest due), then the oldest open item.
+export function pickFocusItem(rows = [], now = new Date()) {
+  const open = (rows || []).filter((row) => row && (!row.status || row.status === "open") && row.type !== "journal");
+  if (!open.length) return null;
+  const dueSoon = open.filter((row) => Date.parse(row.dueAt) <= now.getTime() + DUE_SOON_MS)
+    .sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt));
+  if (dueSoon.length) return dueSoon[0];
+  return [...open].sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0))[0];
+}
+
+export function inboxFocusMarkup(id) {
+  return { inline_keyboard: [[
+    { text: "✅ 완료", callback_data: `inbox:done:${id}` },
+    { text: "⏰ 내일 다시", callback_data: `inbox:later:${id}` },
+  ]] };
+}
+
+// "N일째 · 마감 M/D" style annotation for an open inbox item.
+export function inboxAgeLabel(row, now = new Date()) {
+  const parts = [];
+  const created = Date.parse(row?.createdAt);
+  if (Number.isFinite(created)) parts.push(`${Math.max(1, Math.floor((kstDayStart(now) - kstDayStart(new Date(created))) / DAY_MS) + 1)}일째`);
+  const due = Date.parse(row?.dueAt);
+  if (Number.isFinite(due)) {
+    const label = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Seoul", month: "numeric", day: "numeric" }).format(new Date(due));
+    parts.push(`${due < kstDayStart(now) ? "마감 지남" : "마감"} ${label}`);
+  }
+  return parts.join(" · ");
+}
+
+export function applyLatePrefix(text, scheduledAt, now = new Date()) {
+  const value = String(text ?? "");
+  const scheduled = Date.parse(scheduledAt);
+  if (!Number.isFinite(scheduled) || now.getTime() - scheduled <= LATE_AFTER_MS) return { text: value, late: false };
+  return { text: `⏰ 지연 발송 (원래 ${formatKstClock(scheduled)})\n${value}`, late: true };
+}
+
+function kstDayStart(date) {
+  const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(date);
+  return Date.parse(`${day}T00:00:00+09:00`);
+}
+
+function inboxLine(row, now, suffix = "") {
+  const age = inboxAgeLabel(row, now);
+  return `${row.text}${age ? ` (${age})` : ""}${suffix}`;
 }
 
 export async function generateLocalRecommendations({ kind, snapshot, config, fetchImpl = fetch, now = new Date() }) {
@@ -72,11 +127,10 @@ function compactWeather(weather, dayIndex) {
   };
 }
 
-export function formatMorning(snapshot, recommendations, now, repoLines = []) {
+export function formatMorning(snapshot, recommendations, now, repoLines = [], { focus = pickFocusItem(snapshot.personal?.inbox, now) } = {}) {
   const lines = [`☀️ 모닝 브리핑 · ${dateLabel(now)}`, "", "🌦 날씨", ...weatherLines(snapshot.weather, 0)];
   lines.push("", "📅 일정", ...calendarLines(snapshot.calendar?.today, "오늘 등록된 일정 없음"));
-  const inbox = snapshot.personal?.inbox || [];
-  if (inbox.length) lines.push("", "🎯 오늘의 초점", `• ${inbox[0].text} — 첫 10분에 시작할 단계 하나를 끝내세요.`);
+  if (focus) lines.push("", "🎯 오늘의 초점", `• ${inboxLine(focus, now, " — 첫 10분에 시작할 단계 하나를 끝내세요.")}`);
   if (repoLines.length) lines.push("", "🧰 저장소 점검", ...repoLines);
   if (recommendations.length) lines.push("", "💡 오늘의 추천", ...recommendations.map((row) => `• ${row}`));
   return lines.join("\n");
@@ -90,7 +144,7 @@ function formatEvening(snapshot, recommendations, now) {
   const completedToday = completed.filter((row) => Date.parse(row.updatedAt) >= dayStart.getTime()).slice(0, 2);
   const wrapUp = [
     ...completedToday.map((row) => `• 완료 · ${row.text}`),
-    ...inbox.slice(0, Math.max(0, 3 - completedToday.length)).map((row) => `• 미완료 · ${row.text}`),
+    ...inbox.slice(0, Math.max(0, 3 - completedToday.length)).map((row) => `• 미완료 · ${inboxLine(row, now)}`),
   ];
   if (wrapUp.length) lines.push("", "✅ 오늘 정리", ...wrapUp);
   lines.push("", "📈 Trading dry-run", ...tradingLines(snapshot.trading));

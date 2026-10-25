@@ -10,6 +10,7 @@
     "stop:daemon": "scripts/bridge-daemon.sh stop",
     "status:daemon": "scripts/bridge-daemon.sh status",
     "install:startup": "scripts/install_launchd_startup.sh",
+    "install:watchdog": "scripts/install_watchdog.sh",
     "personal-ops:backup": "scripts/backup-personal-ops.sh",
     "test": "node --test",
     "verify": "node scripts/verify.mjs",

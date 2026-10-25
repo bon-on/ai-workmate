@@ -6,6 +6,8 @@ related_specs:
   - claude-primary
   - ai-usage-report
   - english-study
+  - daily-ux
+  - emoticon-studio
 ---
 # Claude primary engine
 ## Context

@@ -174,9 +174,9 @@ test("/status shows Claude limits next to Codex limits", async () => {
     readCodexLimits: async () => ({ status: "available", fiveHour: { remainingPercent: 70 }, weekly: { remainingPercent: 80 } }),
   });
   const lines = sent[0].split("\n");
-  const codexIdx = lines.findIndex((l) => l === "Codex limits: 5h 70% remaining | 7d 80% remaining");
+  const codexIdx = lines.findIndex((l) => l === "Codex 한도: 5시간 70% 남음 | 7일 80% 남음");
   assert.ok(codexIdx >= 0, sent[0]);
-  assert.equal(lines[codexIdx + 1], "Claude limits: 5h 60% remaining | 7d 90% remaining");
+  assert.equal(lines[codexIdx + 1], "Claude 한도: 5시간 60% 남음 | 7일 90% 남음");
 
   // Unobserved Claude state is reported, not omitted.
   sent.length = 0;
@@ -187,16 +187,17 @@ test("/status shows Claude limits next to Codex limits", async () => {
     jobs: { getActiveJob: () => null, claudeLimits: new ClaudeLimitState(path.join(dir, "none.json")) },
     workspaces: { getActiveWorkspace: () => ({ alias: "default", path: "/tmp" }) },
   });
-  assert.match(sent[0], /Claude limits: not observed yet/);
+  assert.match(sent[0], /Claude 한도: 아직 확인 전/);
 });
 
-test("job header shows the Codex fallback line only for Codex fallbacks", () => {
+test("result footer shows the Codex fallback only for Codex fallbacks", () => {
   const base = { jobId: "j", status: "completed", workspaceAlias: "default", summary: "ok", sessionId: "s" };
   const fallback = buildCompletionMessage({ ...base, provider: "codex", fallbackFrom: "claude", fallbackReason: "Claude 사용 한도 도달" });
-  assert.match(fallback, /^Codex job completed\./);
-  assert.match(fallback, /\nFallback: Codex \(Claude 사용 한도 도달\)\n/);
-  assert.doesNotMatch(buildCompletionMessage({ ...base, provider: "claude", fallbackReason: null }), /Fallback:/);
-  assert.doesNotMatch(buildCompletionMessage({ ...base, provider: "claude", fallbackReason: "x" }), /Fallback:/);
+  assert.match(fallback, /^ok\n/);
+  assert.match(fallback, /Codex 대체\(Claude 사용 한도 도달\)/);
+  assert.match(fallback, /\/job j/);
+  assert.doesNotMatch(buildCompletionMessage({ ...base, provider: "claude", fallbackReason: null }), /대체/);
+  assert.doesNotMatch(buildCompletionMessage({ ...base, provider: "claude", fallbackReason: "x" }), /대체/);
 });
 
 test("config defaults: Claude fallback threshold 0.95 and scheduled Claude effort mapping", async () => {

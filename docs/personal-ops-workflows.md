@@ -1,12 +1,8 @@
 # AI Workmate Personal Operations
 
-The following n8n workflow drafts are installed but intentionally unpublished:
+The n8n draft `AI Workmate - Morning Brief` is installed but intentionally unpublished; the morning and evening briefings are now built by the bridge itself. The earlier `Research Digest` and `Incident Intake` drafts were removed from n8n, and their JSON stays under `workflows/` for reference.
 
-- `AI Workmate - Morning Brief`
-- `AI Workmate - Research Digest`
-- `AI Workmate - Incident Intake`
-
-They remain inactive because the local n8n credential store currently has no Google or Telegram credentials. Before publishing:
+The draft remains inactive because the local n8n credential store has no Google or Telegram credentials. Before publishing it or re-importing another draft:
 
 1. Add a Telegram credential and select it in each `Send ...` node.
 2. Replace the Telegram chat ID placeholder.

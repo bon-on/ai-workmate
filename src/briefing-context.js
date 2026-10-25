@@ -50,11 +50,13 @@ export async function buildBriefingContext({ config, chatId, personalOps, schedu
     weather,
     personal: {
       summary: personalOps?.summary?.(chatId) ?? null,
-      inbox: (personalOps?.listInbox?.(chatId) ?? []).slice(0, 30),
+      inbox: (personalOps?.listInbox?.(chatId) ?? []).slice(0, 30).map((row) => ({ ...row, waitingDays: waitingDays(row.createdAt, now) })),
       activity: personalOps?.activitySummary?.(chatId, { days: 7, now }) ?? null,
       preferences: (personalOps?.listPreferences?.(chatId) ?? []).slice(0, 30),
-      watches: (personalOps?.listWatches?.(chatId) ?? []).slice(0, 30),
-      schedules: (schedules?.list?.(chatId) ?? []).map((row) => ({ id: row.id, nextRunAt: row.nextRunAt, failures: row.failureCount, label: row.prompt.split("\n")[0] })).slice(0, 20),
+      watches: compactWatches(personalOps?.listWatches?.(chatId) ?? []),
+      // currentFailureStreak resets on success; recentRunIssues keeps the past 7 days of failed/late runs.
+      schedules: (schedules?.list?.(chatId) ?? []).map((row) => ({ id: row.id, nextRunAt: row.nextRunAt, currentFailureStreak: row.failureCount, label: row.prompt.split("\n")[0] })).slice(0, 20),
+      recentRunIssues: personalOps?.listRunIssues?.(chatId, { days: 7, now }) ?? [],
       recentBriefings: (personalOps?.listBriefingHistory?.(chatId, { days: 30, limit: 20, now }) ?? []).map((row) => ({
         id: row.id,
         kind: row.kind,
@@ -179,7 +181,19 @@ async function readWeatherOnce(config, fetchImpl) {
   }
 }
 
+function waitingDays(createdAt, now) {
+  const created = Date.parse(createdAt);
+  return Number.isFinite(created) ? Math.max(0, Math.floor((now.getTime() - created) / 86400000)) : null;
+}
+
 async function safely(run) {
   try { return { ok: true, data: await run() }; }
   catch (error) { return { ok: false, error: String(error.message).slice(0, 300) }; }
+}
+
+// Only metadata: scraped page text (snapshots, excerpts) is untrusted and large, so it never reaches AI prompts.
+export function compactWatches(rows) {
+  return rows.slice(0, 30).map((row) => ({
+    id: row.id, label: row.label, url: row.url, lastChangedAt: row.lastChangedAt ?? null, failureCount: row.failureCount ?? 0,
+  }));
 }

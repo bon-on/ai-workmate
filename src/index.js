@@ -6,7 +6,7 @@ import { ClaudeLimitState } from "./claude-runner.js";
 import { ApprovalStore } from "./approval-store.js";
 import { ProcessManager } from "./process-manager.js";
 import { formatError, PollFailureTracker } from "./poll-recovery.js";
-import { handleUpdate } from "./router.js";
+import { BOT_COMMANDS, handleUpdate } from "./router.js";
 import { MemoryStore } from "./memory-store.js";
 import { ScheduleStore } from "./schedule-store.js";
 import { runDueSchedules } from "./scheduler.js";
@@ -23,6 +23,8 @@ import { buildLocalBriefing } from "./local-briefing.js";
 import { runEnglishStudy } from "./english-study.js";
 import { installLogTimestamps, trimRuntimeLogs } from "./maintenance.js";
 import { runOperationalMonitor } from "./operational-monitor.js";
+import { checkUsagePause } from "./usage-pause.js";
+import { N8nManager } from "./n8n-manager.js";
 import { maybeRunDailyRepoChecks } from "./repo-checks.js";
 import { announceRestart } from "./ops-actions.js";
 
@@ -42,6 +44,7 @@ const claudeLimits = new ClaudeLimitState(config.claudeLimitStatePath, {
 });
 const jobs = new JobManager(config, { claudeLimits });
 const workspaces = new WorkspaceSessionStore(config.workspaces);
+const n8n = new N8nManager({ port: config.n8nPort });
 const processes = new ProcessManager();
 const sessions = new TelegramSessionStore(config.sessionStatePath);
 const memories = new MemoryStore(config.memoryStatePath);
@@ -50,7 +53,7 @@ const approvals = new ApprovalStore();
 const personalOps = new PersonalOpsStore(config.personalOpsStatePath);
 const readCodexLimits = createCodexLimitReader({ executable: config.codexExecutable });
 
-const { settleJob } = createJobSettler({ config, telegram, jobs, workspaces, schedules, personalOps, sessions });
+const { settleJob } = createJobSettler({ config, telegram, jobs, workspaces, schedules, personalOps, sessions, readCodexLimits });
 
 const abortController = new AbortController();
 let nextOffset = null;
@@ -100,7 +103,9 @@ async function main() {
     memories,
     approvals,
     personalOps,
+    onJobSettled: settleJob,
   });
+  telegram.setMyCommands(BOT_COMMANDS).catch((error) => console.error("Command menu registration failed:", error.message));
   warnOnWebhookConflict().catch((error) => console.error("Webhook check failed:", error.message));
   console.log(`Telegram AI bridge started (primary engine: ${config.aiProvider}).`);
   announceRestart({ config, telegram }).catch((error) => console.error("Restart notice failed:", error.message));
@@ -185,7 +190,7 @@ async function runWatchTick() {
 
 async function runMonitorTick() {
   if (shuttingDown) return;
-  await runOperationalMonitor({ config, schedules, personalOps, telegram });
+  await runOperationalMonitor({ config, schedules, personalOps, telegram, n8n });
   await maybeRunDailyRepoChecks({ config, personalOps })
     .catch((error) => console.error("Repository checks failed:", error.message));
 }
@@ -195,6 +200,8 @@ async function runScheduleTick() {
     return;
   }
 
+  await checkUsagePause({ schedules, readCodexLimits, telegram, fallbackChatId: config.defaultTelegramTargetChatId })
+    .catch((error) => console.error("Usage pause check failed:", error.message));
   await runDueSchedules({
     schedules,
     jobs,

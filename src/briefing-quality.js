@@ -96,3 +96,24 @@ function similarity(left, right) {
 function tokens(value) {
   return new Set(String(value || "").toLowerCase().match(/[가-힣a-z0-9]{2,}/g) || []);
 }
+
+export const LATE_BRIEFING_PREFIX = "⏰ 지연 발송";
+
+// Dashboard health for the last 14 days. A delivery counts as late when its
+// recorded text starts with the scheduler's late prefix (or the row has late: true);
+// local build failures come from run metrics (source "local", status not completed).
+export function summarizeBriefingHealth({ personalOps, chatId, now = new Date() }) {
+  const days = 14;
+  const briefings = personalOps?.listBriefingHistory?.(chatId, { days, limit: 200, now }) ?? [];
+  const runs = personalOps?.listRunMetrics?.(chatId, { days, now }) ?? [];
+  const lateDeliveries = briefings.filter((row) => row.late === true || String(row.text || "").startsWith(LATE_BRIEFING_PREFIX)).length;
+  const feedbackCount = briefings.filter((row) => row.feedback || Object.keys(row.recommendationFeedback || {}).length).length;
+  return {
+    days,
+    briefings: briefings.length,
+    lateDeliveries,
+    feedbackCount,
+    feedbackRate: briefings.length ? Math.round((feedbackCount / briefings.length) * 100) / 100 : 0,
+    localFailures: runs.filter((row) => row.source === "local" && row.status !== "completed").length,
+  };
+}

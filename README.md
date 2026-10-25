@@ -60,6 +60,7 @@ flowchart LR
 | `/admin <요청>` | 시스템 전체 권한 작업 (승인 버튼 필요) |
 | `/delegate <요청>` · `/delegates` · `/delegate-cancel <id>` | 동시에 도는 별도 작업 |
 | `/status` · `/jobs` · `/job <id>` · `/job-logs <id>` · `/cancel` | 작업 상태 확인과 취소 |
+| (작업 중 새 요청) | "백그라운드로 실행" 버튼으로 기다리지 않고 별도 작업으로 맡기기 |
 | `/dashboard` | 진행 중인 작업, 동시 작업 여유, 프로세스, 예약 요약 |
 | `/new` · `/reset` | 답장으로 이어지던 세션 초기화 |
 | `/remember <내용>` · `/memories` · `/forget <id>` | workspace별 메모리 |
@@ -67,7 +68,10 @@ flowchart LR
 | `/serve <명령>` · `/ps` · `/logs <id>` · `/stop <id>` | 백그라운드 서버 관리 |
 | `/research <주제>` · `/brief` · `/incident <내용>` | 출처 있는 리서치, 운영 요약, 장애 진단 |
 | `/file <경로>` | workspace 파일 받기 |
-| `/tools` · `/capabilities` · `/help` | 사용 가능한 기능 안내 |
+| `/help` · `/help <주제>` | 한국어 기능 안내 (주제: ai, schedule, inbox, ops, workspace). 텔레그램 "/" 메뉴에도 등록됩니다 |
+| `/tools` · `/capabilities` | 사용 가능한 도구 목록 |
+
+결과 메시지 끝에는 `✅ Claude · 2분 · /job <id>`처럼 엔진, 걸린 시간, 상세 명령이 한 줄로 붙습니다.
 
 ---
 
@@ -83,7 +87,9 @@ flowchart LR
 - 단순 알림은 AI를 쓰지 않고 바로 보냅니다. AI 사용량이 일시 중지된 동안에도 알림은 그대로 갑니다.
 - 리서치·요약처럼 AI가 필요한 요청은 예약 시각에 샌드박스 작업으로 실행되고, 끝나면 결과를 보냅니다.
 - `/schedule in 10m <요청>`, `/schedule every 1h <요청>`, `/schedule 매일 9시 <요청>`, `/schedule 평일 9시 <요청>`
-- `/schedules`로 목록을 보고 `/unschedule <id>`로 지웁니다.
+- `/schedules`는 이름, 반복(매일·평일 08:00 등), 다음 실행 시각(KST)을 보여 줍니다. `/unschedule <id>`로 지우고, `/runnow <id>`로 지금 실행, `/skip <id>`로 한 번 건너뜁니다.
+- AI 사용 한도에 걸리면 AI 예약 작업만 잠시 멈추고 한 번 안내합니다. 정지는 Codex 계정의 한도 리셋 시각까지이고(모르면 6시간), 정지 중 15분마다 한도를 다시 읽어 먼저 풀리면 바로 재개하며 재개도 한 번 알립니다. 한도 때문에 실패한 예약은 실패로 세지 않습니다. 모닝·이브닝 브리핑, 영어 학습, 단순 알림은 계속 발송되고, `/resume`으로 바로 풀 수 있습니다.
+- 예약 작업 실패 알림은 실패가 시작될 때 한 번만 옵니다. 같은 예약이 성공한 뒤 다시 실패하면 그때 다시 알립니다.
 - 예약은 재시작해도 한 번만 실행됩니다. 실행 전에 다음 회차를 먼저 저장하기 때문입니다.
 
 ---
@@ -149,8 +155,9 @@ flowchart LR
 /lab now 개인 사진 아카이브의 중복 제거 전략
 ```
 
-- **Inbox**: 할 일, 읽을거리, 아이디어, 문서, 일기, 요청을 모아 두고 `/done`, `/snooze <id> [시간]`, `/archive`로 정리합니다.
-- **웹 감시**: `/watches`로 목록을 보고 `/unwatch <id>`로 멈춥니다. 처음 확인한 내용을 기준으로 두고, 본문이 의미 있게 바뀔 때만 알립니다. localhost, 사설망, 인증 정보가 든 URL, HTTP가 아닌 주소는 거부합니다.
+- **빠른 기록**: `할일: 우유 사기 내일`, `메모: …`, `아이디어: …`, `읽기: <URL>`처럼 보내면 AI 없이 바로 Inbox에 저장됩니다. 끝에 `오늘`·`내일`·`모레`·`10/30`·`10월 30일`을 붙이면 기한이 됩니다.
+- **Inbox**: 할 일, 읽을거리, 아이디어, 문서, 일기, 요청을 모아 두고 `/done`, `/snooze <id> [시간]`, `/archive`로 정리합니다. 모닝 브리핑의 "오늘의 초점"은 기한이 임박한 항목, 없으면 가장 오래 기다린 항목을 고르고 [완료]·[내일로] 버튼을 붙입니다.
+- **웹 감시**: `/watches`로 목록을 보고 `/unwatch <id>`로 멈춥니다. 처음 확인한 내용을 기준으로 두고, 본문이 의미 있게 바뀔 때만 바뀐 줄 몇 개와 함께 알립니다. localhost, 사설망, 인증 정보가 든 URL, HTTP가 아닌 주소는 거부합니다.
 - **AI 실험실**: `/lab now <주제>`로 리서치를 바로 맡기고, `/lab list`·`read`·`archive`·`restore`로 결과를 관리합니다. `/lab practice|implement|research <id> <과제>`로 후속 작업을 이어 붙일 수 있습니다. 결과는 Markdown 보고서로 `documents/reports/`에 남습니다.
 - **창작 작업**: `/creative tonight <요청>`은 23:00에 테스트까지 거친 결과물을 만듭니다.
 
@@ -167,12 +174,16 @@ tailscale serve --bg http://127.0.0.1:8766
 
 | 탭 | 내용 |
 |---|---|
-| 오늘 | 요청 입력창, 결과와 결정, 할 일·Inbox, 최근 브리핑, 다음 일정, Claude·Codex 사용 한도 |
+| 오늘 | 상태 줄(AI 예약 일시정지·실패 중인 예약과 해제/지금 실행 버튼), 요청 입력창("텔레그램으로도 받기"), 결과 전문 보기, 할 일·Inbox(기한, N일째, 미루기), 최근 브리핑(전문, 👍/👎, 다시 보내기), 다음 일정, 사용 한도 |
 | AI 실험실 | 문서함(Markdown 뷰어), 조사 보고서와 후속 작업, 실험 대기열과 결과 |
-| 자동화 | n8n 워크플로(실행·재시도·게시), 실패한 자동화, 예약 작업, 최근 AI 작업, 관리 프로세스 |
+| 자동화 | n8n 워크플로(실행·재시도·게시), 실패한 자동화, 예약 작업(지금 실행·한 번 건너뛰기·삭제), 최근 AI 작업, 관리 프로세스 |
 | Trading | 오늘의 dry-run(포지션·주문·후보 종목·실험), 내 보유자산 |
-| 시스템 | Mac과 서비스 상태, 외장 저장소와 사진 백업, 코드 저장소 점검("지금 점검" 버튼) |
-| 설정 | 추천 선호, 사용량과 품질(폴백·실패·재시도), 보관함 |
+| 시스템 | Mac과 서비스 상태, 외장 저장소와 사진 백업(설정한 경우), 코드 저장소 점검(24시간 지나면 "오래됨"과 재점검 버튼) |
+| 설정 | 추천 선호, 사용량과 브리핑 상태(지연 발송·피드백·로컬 생성 실패), 접근 보안, 보관함 |
+| 이모티콘 | 형제 폴더 imoticon-maker와 연동하는 이모티콘 작업 화면 (`harness/specs/emoticon-studio.md`) |
+
+대시보드에서 보낸 요청도 텔레그램 요청과 똑같이 정산됩니다. 사용량에 기록되고, 결과는 텔레그램으로도 와서 답장으로 이어갈 수 있습니다. 결과 전문은 재시작 후에도 대시보드에서 다시 볼 수 있습니다.
+`DASHBOARD_TAILNET_USERS`를 설정하면 `*.ts.net`으로 들어온 실행 요청은 그 목록의 tailnet 사용자만 할 수 있습니다.
 
 ---
 
@@ -226,8 +237,11 @@ tailscale serve --bg http://127.0.0.1:8766
   - 예약된 브리핑이 오지 않음
   - 외장 SSD 연결 끊김 또는 용량 부족
   - 사진 백업이 오래됨
-  - 예약 작업이 계속 실패함
+  - 예약 작업이 실패함 (예약 이름, 원인, `/runnow <id>` 안내. 같은 실패 상태는 한 번만)
+  - 활성 n8n 워크플로 실행 실패 (하루 1번 요약)
+- 늦게 만든 브리핑에는 `⏰ 지연 발송 (원래 20:00)`이 붙습니다.
 - 알림 간격과 30일 사용량 지표는 재시작해도 유지됩니다.
+- 브리지 자체가 죽으면 안에서 알릴 수 없으므로, 별도 watchdog이 5분마다 대시보드를 확인합니다. 두 번 연속 응답이 없으면 한 번, 복구되면 한 번 텔레그램으로 알립니다. `npm run install:watchdog`으로 설치합니다.
 - `/health`로 AI Workmate, n8n, Trading, Ollama, 외장 저장소 상태를 확인합니다.
 - `npm run personal-ops:backup`은 상태 JSON과 n8n SQLite를 `EXTERNAL_STORAGE_PATH`에 백업합니다. 오래된 백업은 목록만 보여 주고 지우지 않습니다.
 
@@ -269,6 +283,7 @@ cp .env.example .env          # TELEGRAM_BOT_TOKEN, CODEX_WORKSPACE 등 입력
 
 ```bash
 npm run install:startup       # 로그인 시 자동 시작, KeepAlive
+npm run install:watchdog      # 브리지 밖에서 5분마다 상태 확인
 ```
 
 - 서비스 이름은 `AI_WORKMATE_LAUNCHD_LABEL`(기본 `com.ai-workmate.bridge`)이고, 환경변수나 `.env`에서 읽습니다.
@@ -347,6 +362,8 @@ npm run install:startup       # 로그인 시 자동 시작, KeepAlive
 |---|---|
 | `DASHBOARD_ENABLED`, `DASHBOARD_HOST`, `DASHBOARD_PORT` | 기본 `true`, `127.0.0.1`, `8766` |
 | `DASHBOARD_ALLOWED_HOSTS` | 대시보드에 접속할 수 있는 추가 호스트 이름 (loopback과 `*.ts.net`은 기본 허용) |
+| `DASHBOARD_TAILNET_USERS` | `*.ts.net`으로 실행 요청을 보낼 수 있는 tailnet 로그인(쉼표 구분). 비우면 tailnet의 모든 기기가 가능 |
+| `IMOTICON_MAKER_PATH`, `IMOTICON_PYTHON` | 이모티콘 탭이 쓰는 imoticon-maker 체크아웃(기본 `../imoticon-maker`)과 Python(기본 `python3`) |
 | `TRADING_DASHBOARD_PORT`, `N8N_PORT` | 허브에 표시할 서비스 포트 |
 | `OPERATIONAL_MONITORING_ENABLED` | 이상 알림 (기본 `true`) |
 | `EXTERNAL_STORAGE_PATH`, `PHOTO_BACKUP_PATH` | 외장 SSD와 사진 백업 경로 |

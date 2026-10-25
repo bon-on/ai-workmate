@@ -210,7 +210,7 @@ test("handleMessage starts a new session for plain text messages", async () => {
   assert.equal(started[0].workspace.alias, "default");
   assert.equal(started[0].unrestricted, false);
   assert.equal(sent.length, 1);
-  assert.match(sent[0][1], /Mode: new/);
+  assert.equal(sent[0][1], "접수했습니다 · Codex · /job abc123");
 });
 
 test("dashboard requests keep bridge safety restrictions", async () => {
@@ -643,8 +643,9 @@ test("handleMessage creates and lists scheduled jobs", async () => {
 
   assert.equal(added[0].workspaceAlias, "default");
   assert.equal(added[0].prompt, "상태 요약");
-  assert.match(sent[0][1], /Scheduled sch-1/);
-  assert.match(sent[1][1], /sch-1 \| default/);
+  assert.match(sent[0][1], /^예약했습니다: sch-1\n상태 요약\n반복: 한 번\n다음 실행: .+\n취소: \/unschedule sch-1$/);
+  assert.match(sent[1][1], /• 상태 요약 · 한 번\n  다음 6\. 19\. \(금\) 09:10 · 취소 \/unschedule sch-1/);
+  assert.doesNotMatch(sent[1][1], /2026-06-19T|Z\b/);
 });
 
 test("handleMessage shows tools and process logs", async () => {
@@ -921,7 +922,7 @@ test("handleMessage starts and lists delegated jobs", async () => {
   assert.equal(started[0].allowConcurrent, true);
   assert.equal(started[0].jobKind, "delegate");
   assert.deepEqual(started[0].memories, [{ id: "mem-1", text: "memory" }]);
-  assert.match(sent[0][1], /Delegated job started/);
+  assert.match(sent[0][1], /백그라운드 작업을 시작했습니다 · \/job /);
 
   await handleMessage({
     message: {
@@ -965,7 +966,7 @@ test("handleMessage starts and lists delegated jobs", async () => {
     onJobSettled() {},
   });
 
-  assert.match(sent[1][1], /del-1 \| running \| default/);
+  assert.match(sent[1][1], /del-1 \| 실행 중 \| default/);
 });
 
 test("handleMessage cancels delegated jobs by id", async () => {
@@ -1007,7 +1008,7 @@ test("handleMessage cancels delegated jobs by id", async () => {
   });
 
   assert.deepEqual(calls[0], ["cancel", 100, "del-1", { kind: "delegate" }]);
-  assert.match(calls[1][2], /Cancellation requested/);
+  assert.match(calls[1][2], /백그라운드 작업 del-1 중단을 요청했습니다/);
 });
 
 

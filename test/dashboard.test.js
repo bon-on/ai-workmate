@@ -46,7 +46,7 @@ test("dashboard separates operational failures from decisions and requests immed
   assert.match(html, /오류 상세/);
   assert.match(html, /최근 실패한 자동화 · 최대 5건/);
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
-  const fn = script.slice(script.indexOf("    function renderOperations("), script.indexOf("    function ", script.indexOf("    function renderOperations(") + 15));
+  const fn = script.slice(script.indexOf("    function renderOperations("), script.indexOf("    let tradingDetailKey"));
   const elements = {};
   const context = vm.createContext({ document: { getElementById: id => elements[id] ||= {} }, metric: () => "", escapeText: x => x, formatInteger: String, formatTime: String });
   vm.runInContext(fn, context);
@@ -146,7 +146,7 @@ test("emitted dashboard renders Claude limits into their own section with the fa
 test("emitted job table shows the engine, model and fallback reason", () => {
   const script = renderDashboardHtml({ allowedChatIds: ["100"] }).match(/<script>([\s\S]*?)<\/script>/)[1];
   const pick = (name, next) => script.slice(script.indexOf(`    function ${name}(`), script.indexOf(`    function ${next}(`));
-  const context = vm.createContext({ badge: String });
+  const context = vm.createContext({ badge: String, formatTime: String });
   const escapeText = script.match(/    function escapeText\(value\) \{[\s\S]*?\n    \}\n/)[0];
   vm.runInContext(pick("renderJobs", "renderEngine") + pick("renderEngine", "renderProcesses") + escapeText, context);
   const html = context.renderJobs([
@@ -154,7 +154,7 @@ test("emitted job table shows the engine, model and fallback reason", () => {
     { jobId: "b", kind: "chat", status: "completed", provider: "codex", fallbackReason: "Claude <limit>", prompt: "p", age: "1m" },
     { jobId: "c", kind: "chat", status: "completed", prompt: "p", age: "1m" },
   ], "none");
-  assert.match(html, /<th style="width:120px">Engine<\/th>/);
+  assert.match(html, /<th style="width:120px">엔진<\/th>/);
   assert.match(html, /Claude<br><span class="meta">sonnet<\/span>/);
   assert.match(html, /폴백 · Claude &lt;limit&gt;/);
   assert.match(html, /<td><span class="meta">-<\/span><\/td>/);
