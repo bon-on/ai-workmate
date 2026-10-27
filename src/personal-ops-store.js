@@ -18,6 +18,7 @@ export class PersonalOpsStore {
     this.experiments = new Map();
     this.trendTopics = [];
     this.repoChecks = null;
+    this.repoChecksBriefed = {};
     this.englishStudy = { words: [], links: [] };
     this.saveQueue = Promise.resolve();
   }
@@ -35,6 +36,7 @@ export class PersonalOpsStore {
       this.experiments = new Map((parsed.experiments ?? []).filter(validExperiment).map((row) => [row.id, row]));
       this.trendTopics = (parsed.trendTopics ?? []).filter((row) => row?.chatId && row?.title && row?.sentAt);
       this.repoChecks = parsed.repoChecks?.checkedAt && Array.isArray(parsed.repoChecks.repos) ? parsed.repoChecks : null;
+      this.repoChecksBriefed = validRepoChecksBriefed(parsed.repoChecksBriefed);
       this.englishStudy = {
         words: (Array.isArray(parsed.englishStudy?.words) ? parsed.englishStudy.words : []).filter((row) => row?.chatId && row?.word && row?.sentAt),
         links: (Array.isArray(parsed.englishStudy?.links) ? parsed.englishStudy.links : []).filter((row) => row?.chatId && row?.link),
@@ -324,6 +326,16 @@ export class PersonalOpsStore {
     return result;
   }
 
+  // Repo-check issues already shown in a morning briefing, by repo name.
+  getRepoChecksBriefed() {
+    return this.repoChecksBriefed;
+  }
+
+  async setRepoChecksBriefed(state) {
+    this.repoChecksBriefed = validRepoChecksBriefed(state);
+    await this.#save();
+  }
+
   getEnglishStudy(chatId) {
     const id = String(chatId);
     return {
@@ -455,6 +467,7 @@ export class PersonalOpsStore {
       experiments: [...this.experiments.values()],
       trendTopics: this.trendTopics,
       repoChecks: this.repoChecks,
+      repoChecksBriefed: this.repoChecksBriefed,
       englishStudy: this.englishStudy,
     };
     const serialized = `${JSON.stringify(payload, null, 2)}\n`;
@@ -511,6 +524,13 @@ function validRunMetric(row) {
 }
 
 function validAlert(row) { return row && typeof row.key === "string" && typeof row.sentAt === "string"; }
+
+function validRepoChecksBriefed(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, issues]) => Array.isArray(issues))
+    .map(([name, issues]) => [name, issues.filter((issue) => typeof issue === "string")]));
+}
 
 function validExperiment(row) {
   return row && typeof row.id === "string" && typeof row.chatId === "string"

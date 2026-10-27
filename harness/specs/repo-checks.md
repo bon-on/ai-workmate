@@ -21,10 +21,10 @@ Harness drift (audit warnings, evidence that no longer matches the code, overdue
 - Audit warnings/critical findings, invalid or missing evidence and maintenance reviews older than 30 days are reported per repo with their codes.
 - Publish blockers: private keys, known token formats (Anthropic, OpenAI, GitHub, AWS, Slack, Telegram bot), quoted secret assignments, and committable `.env` files (`.env.example`/`.env.sample` allowed). Warnings: the home directory path, extra private terms from `PUBLISH_CHECK_PRIVATE_TERMS`, files over 5 MB. Missing README, LICENSE or `.gitignore` are listed.
 - Reports name rule, file and line only; matched secret text is never stored, logged or sent.
-- The latest result persists across restarts; the morning briefing shows at most three repos with issues, or one line when all are clean, and nothing when no run exists.
+- The latest result persists across restarts. The morning briefing shows only issues not shown in an earlier morning briefing (new, or changed text such as a different count; the growing day count of an overdue maintenance review is not a change), one line per repo with its first new issue and "외 N건" for its other new issues, at most three repos plus a "외 N개 저장소" line, and one "해결됨" line per repo whose briefed issues are all gone; nothing when no run exists or nothing changed. Briefed issues per repo persist in personal-ops state, shared by all chats (single-user bridge), and are recorded when any morning briefing, including a manual `/morning`, is built (a failed send drops them from later briefings; `/repos` and the dashboard still list every issue; a failed state save is logged and the briefing still goes out). A result older than two days adds a stale line and leaves the briefed state unchanged. The weekly report keeps the full current list.
 - A missing harness-lab CLI or a failing command is reported as that repo's check error, not as a clean result.
 ## Constraints
 - No AI calls; external commands have timeouts; scanning skips dependency/build directories, binary files and files over 1 MB.
 ## Evidence
-- test/repo-checks.test.js: discovery, audit/evidence parsing with a stubbed CLI, publish rules and masking, non-Git ignore handling, daily gating, briefing and command output.
+- test/repo-checks.test.js: discovery, audit/evidence parsing with a stubbed CLI, publish rules and masking, non-Git ignore handling, daily gating, briefing lines and morning delta (new, changed, resolved, stale, persisted briefed state), command output.
 - npm run verify:harness

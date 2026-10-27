@@ -1,5 +1,5 @@
 import { buildBriefingContext } from "./briefing-context.js";
-import { repoCheckBriefingLines } from "./repo-checks.js";
+import { repoCheckBriefingDelta } from "./repo-checks.js";
 import { formatKstClock } from "./schedule-names.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -24,8 +24,19 @@ export async function buildLocalBriefing({ kind, config, chatId, personalOps, sc
   if (kind !== "morning") return formatEvening(snapshot, recommendations, now);
   // The full open list, not the newest-30 context slice, so old items can surface.
   const focus = pickFocusItem(personalOps?.listInbox?.(chatId, { now }) ?? snapshot.personal?.inbox, now);
-  const summary = formatMorning(snapshot, recommendations, now, repoCheckBriefingLines(personalOps?.getRepoChecks?.(), { now }), { focus });
+  const summary = formatMorning(snapshot, recommendations, now, await morningRepoLines(personalOps, now), { focus });
   return focus ? { summary, replyMarkup: inboxFocusMarkup(focus.id) } : summary;
+}
+
+// Repo-check lines not yet briefed. Marked before sending: a failed send drops them
+// from later briefings, but /repos and the dashboard still show them.
+export async function morningRepoLines(personalOps, now = new Date()) {
+  const repo = repoCheckBriefingDelta(personalOps?.getRepoChecks?.(), personalOps?.getRepoChecksBriefed?.(), { now });
+  if (repo.state) {
+    try { await personalOps.setRepoChecksBriefed?.(repo.state); }
+    catch (error) { console.error("Repo check briefing state save failed:", error.message); }
+  }
+  return repo.lines;
 }
 
 // Overdue or due within two days first (earliest due), then the oldest open item.

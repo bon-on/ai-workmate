@@ -294,6 +294,34 @@ export function repoCheckBriefingLines(result, { now = new Date() } = {}) {
   return lines;
 }
 
+// Morning briefing: only issues not already briefed, plus repos whose briefed issues are gone.
+// `state` is what the caller stores as briefed; null leaves the stored state unchanged.
+export function repoCheckBriefingDelta(result, briefed = {}, { now = new Date() } = {}) {
+  if (!result?.repos?.length) return { lines: [], state: null };
+  const stale = now.getTime() - Date.parse(result.checkedAt) > 2 * DAY_MS;
+  const state = {};
+  const changed = [];
+  const resolved = [];
+  for (const row of result.repos) {
+    const issues = repoIssues(row);
+    const seen = new Set(briefed?.[row.name] || []);
+    if (issues.length) state[row.name] = issues.map(briefingKey);
+    const fresh = issues.filter((issue) => !seen.has(briefingKey(issue)));
+    if (fresh.length) changed.push([row.name, fresh[0], fresh.length - 1]);
+    else if (!issues.length && seen.size) resolved.push(row.name);
+  }
+  const lines = changed.slice(0, 3).map(([name, issue, rest]) => `• ${name} · ${issue}${rest ? ` 외 ${rest}건` : ""}`);
+  if (changed.length > 3) lines.push(`• 외 ${changed.length - 3}개 저장소 · /repos`);
+  lines.push(...resolved.map((name) => `• ${name} · 해결됨`));
+  if (stale) lines.push(`• 마지막 점검 ${seoulTime(result.checkedAt)} — 최신 결과가 아닙니다.`);
+  return { lines, state: stale ? null : state };
+}
+
+// The maintenance age grows daily; only the overdue state itself counts as a change.
+function briefingKey(issue) {
+  return issue.replace(/^유지보수 리뷰 \d+일 경과$/, "유지보수 리뷰 경과");
+}
+
 let inFlight = null;
 
 // Daily, /repos and dashboard runs share one in-flight run, so results never overwrite each other.

@@ -5,10 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import {
   compactRepoChecks, discoverRepos, formatPublishCheck, formatRepoChecks, maybeRunDailyRepoChecks,
-  repoCheckBriefingLines, runHarnessChecks, runRepoChecks, scanPublishReadiness,
+  repoCheckBriefingDelta, repoCheckBriefingLines, runHarnessChecks, runRepoChecks, scanPublishReadiness,
 } from "../src/repo-checks.js";
 import { handleMessage } from "../src/router.js";
 import { executeDashboardCommand } from "../src/dashboard-server.js";
+import { morningRepoLines } from "../src/local-briefing.js";
+import { PersonalOpsStore } from "../src/personal-ops-store.js";
 
 // Built at runtime so this file never contains a literal token the scanner would flag.
 const FAKE_ANTHROPIC = "sk-" + "ant-" + "a1B2".repeat(8);
@@ -127,6 +129,60 @@ test("briefing lines show at most three flagged repos, a clean line, or nothing"
   assert.equal(lines[3], "• 외 1개 저장소 · /repos");
   const stale = repoCheckBriefingLines({ checkedAt: "2026-10-18T00:00:00Z", repos: [clean("a")] }, { now });
   assert.match(stale.at(-1), /최신 결과가 아닙니다/);
+});
+
+test("morning delta shows new or changed issues once, then resolutions, and stays quiet otherwise", () => {
+  const now = new Date("2026-10-22T00:00:00Z");
+  const env = (name) => ({ name, publish: { blockers: [{ rule: "env-file", file: ".env" }], warnings: [], missing: [] } });
+  const env2 = (name) => ({ name, publish: { blockers: [{ rule: "env-file", file: ".env" }], warnings: [], missing: ["LICENSE"] } });
+  const clean = (name) => ({ name, publish: { blockers: [], warnings: [], missing: [] } });
+  const result = (repos, checkedAt = now.toISOString()) => ({ checkedAt, repos });
+
+  assert.deepEqual(repoCheckBriefingDelta(null, {}, { now }), { lines: [], state: null });
+  assert.deepEqual(repoCheckBriefingDelta(result([clean("a")]), {}, { now }), { lines: [], state: {} });
+
+  const first = repoCheckBriefingDelta(result([env("a"), clean("b")]), {}, { now });
+  assert.deepEqual(first.lines, ["• a · 공개 차단 1건 (env-file)"]);
+  assert.deepEqual(first.state, { a: ["공개 차단 1건 (env-file)"] });
+  assert.deepEqual(repoCheckBriefingDelta(result([env("a"), clean("b")]), first.state, { now }).lines, []);
+
+  const grown = repoCheckBriefingDelta(result([env2("a")]), first.state, { now });
+  assert.deepEqual(grown.lines, ["• a · 없음: LICENSE"]);
+
+  const overdue = (ageDays) => ({ name: "m", harnessCheck: { maintenance: { reviewedAt: "2026-09-01", ageDays, due: true } } });
+  const day1 = repoCheckBriefingDelta(result([overdue(51)]), {}, { now });
+  assert.deepEqual(day1.lines, ["• m · 유지보수 리뷰 51일 경과"]);
+  assert.deepEqual(repoCheckBriefingDelta(result([overdue(52)]), day1.state, { now }).lines, []);
+
+  const fixed = repoCheckBriefingDelta(result([clean("a"), env("b")]), grown.state, { now });
+  assert.deepEqual(fixed.lines, ["• b · 공개 차단 1건 (env-file)", "• a · 해결됨"]);
+  assert.deepEqual(fixed.state, { b: ["공개 차단 1건 (env-file)"] });
+
+  const many = repoCheckBriefingDelta(result(["a", "b", "c", "d"].map(env)), {}, { now });
+  assert.equal(many.lines.at(-1), "• 외 1개 저장소 · /repos");
+
+  const stale = repoCheckBriefingDelta(result([env("a")], "2026-10-18T00:00:00Z"), { a: ["공개 차단 1건 (env-file)"] }, { now });
+  assert.equal(stale.state, null);
+  assert.match(stale.lines.at(-1), /최신 결과가 아닙니다/);
+});
+
+test("morning briefing records briefed repo issues so the next morning omits them", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "repo-delta-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, "ops.json");
+  const personalOps = new PersonalOpsStore(statePath);
+  const now = new Date("2026-10-22T00:00:00Z");
+  await personalOps.setRepoChecks({ checkedAt: now.toISOString(), repos: [{ name: "app", publish: { blockers: [], warnings: [], missing: ["LICENSE"] } }] });
+  assert.deepEqual(await morningRepoLines(personalOps, now), ["• app · 없음: LICENSE"]);
+  assert.deepEqual(await morningRepoLines(personalOps, now), []);
+  const failing = { getRepoChecks: () => personalOps.getRepoChecks(), getRepoChecksBriefed: () => ({}), setRepoChecksBriefed: async () => { throw new Error("disk full"); } };
+  const originalError = console.error;
+  console.error = () => {};
+  try { assert.deepEqual(await morningRepoLines(failing, now), ["• app · 없음: LICENSE"]); }
+  finally { console.error = originalError; }
+  const reloaded = new PersonalOpsStore(statePath);
+  await reloaded.load();
+  assert.deepEqual(reloaded.getRepoChecksBriefed(), { app: ["없음: LICENSE"] });
 });
 
 test("daily repo checks run once per Seoul day after the configured hour", async () => {
